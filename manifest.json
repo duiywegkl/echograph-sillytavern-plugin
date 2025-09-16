@@ -1,0 +1,13 @@
+{
+    "id": "echograph-rag-enhancer",
+    "display_name": "EchoGraph 滑动窗口智能增强",
+    "loading_order": 101,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    
+    "author": "EchoGraph Engine",
+    "version": "1.0.0",
+    "homePage": "https://github.com/your-repo/echograph",
+    "description": "基于滑动窗口系统的智能对话增强插件，支持冲突解决和延迟处理"
+}
