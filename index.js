@@ -183,7 +183,8 @@ jQuery(async () => {
             addActivityLog('EchoGraph 已连接', 'success');
             if (outageTimer) clearTimeout(outageTimer);
             outageTimer = null;
-            if (notifiedConnectedChatKey !== activeChatKey || outageReported) showNotification('EchoGraph 已连接', 'success');
+            if (!isInitializing && (notifiedConnectedChatKey !== activeChatKey || outageReported))
+                showNotification('EchoGraph 已连接', 'success');
             notifiedConnectedChatKey = activeChatKey;
             outageReported = false;
             updatePanelStatus('已连接', 'connected');
@@ -267,12 +268,17 @@ jQuery(async () => {
                         }
                     }, 100); // 短延迟确保上下文获取正确
                 } else if (data.type === 'auto_reinitialization_complete') {
-                    // 自动重新初始化完成通知
-                    addActivityLog(`知识图谱重新初始化完成: ${data.character_name || '未知角色'}`, 'success');
+                    const nodes = data.graph_nodes ?? 0;
+                    const edges = data.graph_edges ?? 0;
+                    const message = nodes === 0 ? (data.reason || '角色卡未提取到实体') :
+                        `知识图谱重新初始化完成 (节点: ${nodes}, 关系: ${edges})`;
+                    showNotification(message, nodes === 0 ? 'warning' : 'success');
+                    addActivityLog(message, nodes === 0 ? 'warning' : 'success');
                     refreshPanelStats();
                 } else if (data.type === 'auto_reinitialization_failed') {
-                    // 自动重新初始化失败通知
-                    addActivityLog(`知识图谱重新初始化失败: ${data.error || '未知错误'}`, 'error');
+                    const message = `知识图谱重新初始化失败: ${data.error || '未知错误'}`;
+                    showNotification(message, 'error');
+                    addActivityLog(message, 'error');
                 } else {
                     addActivityLog(`收到未知消息: ${data.type}`, 'info');
                 }
@@ -1002,44 +1008,28 @@ jQuery(async () => {
             ensureWsForCharacter(character.name || '', {force: true});
 
             logDebug('Checking for existing tavern session via WS...');
+            let existingSessionId = null;
             try {
                 const tavernSessionData = await sendInitializationWsRequest('tavern.current_session', {}, 10000, generateConsistentSessionId(character.name || ''), epoch);
                 if (epoch !== sessionEpoch) return false;
                 if (tavernSessionData && tavernSessionData.has_session) {
-                    currentSessionId = tavernSessionData.session_id;
+                    existingSessionId = tavernSessionData.session_id;
                     const hasNodes = (tavernSessionData.graph_nodes || 0) > 0;
-                    const hasEdges = (tavernSessionData.graph_edges || 0) > 0;
-
-                    logDebug('Found existing tavern session', {
-                        sessionId: currentSessionId,
-                        nodes: tavernSessionData.graph_nodes,
-                        edges: tavernSessionData.graph_edges,
-                        hasNodes: hasNodes,
-                        hasEdges: hasEdges
-                    });
-
-                    // 如果会话存在但没有节点，说明会话是空的，需要提交角色数据进行初始化
-                    if (!hasNodes) {
-                        logDebug('Existing session found but empty (no nodes), submitting character data...');
-
-                        //  关键修复：向空会话提交角色数据
-                        const submitSuccess = await submitCharacterDataToBackend(characterId, character);
-                        if (epoch !== sessionEpoch) return false;
-                        if (submitSuccess) {
-                            logDebug('Character data submitted to existing empty session');
-                            addActivityLog(`角色数据已提交到现有会话: ${character.name}`, 'success');
+                    const needsInitialization = tavernSessionData.needs_initialization === true ||
+                        (!hasNodes && tavernSessionData.needs_initialization === undefined &&
+                         tavernSessionData.initialization_status !== 'completed');
+                    if (!forceReinit && !needsInitialization) {
+                        currentSessionId = existingSessionId;
+                        connectWebSocket(currentSessionId);
+                        updateDebugPanel();
+                        if (hasNodes) {
+                            showNotification(`连接到现有酒馆会话: ${character.name}`, 'success');
                         } else {
-                            logDebug('Failed to submit character data to existing session');
+                            addActivityLog(tavernSessionData.initialization_reason || '角色卡未提取到实体', 'warning');
                         }
+                        return true;
                     }
-
-                    showNotification(`连接到现有酒馆会话: ${character.name}`, 'success');
-                    addActivityLog(`连接到现有酒馆会话: ${currentSessionId.substring(0, 8)}... (${caller})`, 'success');
-                    // 连接WebSocket
-                    connectWebSocket(currentSessionId);
-                    // Update UI if debug panel is open
-                    updateDebugPanel();
-                    return true;
+                    logDebug('Existing empty session requires full initialization', tavernSessionData);
                 }
             } catch (error) {
                 logDebug('Failed to check for existing tavern session via WS, will create new one', error);
@@ -1086,7 +1076,7 @@ jQuery(async () => {
 
             // 使用 /initialize 端点而不是 process_message
             const requestBody = {
-                session_id: generateConsistentSessionId(character.name),
+                session_id: existingSessionId || generateConsistentSessionId(character.name),
                 character_card: characterData,
                 world_info: worldInfo,
                 session_config: {
@@ -1119,13 +1109,19 @@ jQuery(async () => {
                 logDebug('Session initialization successful', {
                     sessionId: currentSessionId,
                     characterName: character.name,
-                    nodesCreated: responseData.graph_stats?.nodes_created || 0,
-                    edgesCreated: responseData.graph_stats?.edges_created || 0,
+                    nodesCreated: responseData.graph_stats?.nodes_added || responseData.graph_stats?.nodes_created || 0,
+                    edgesCreated: responseData.graph_stats?.edges_added || responseData.graph_stats?.edges_created || 0,
                     caller: caller
                 });
 
-                showNotification(`为 ${character.name} 初始化会话成功 (节点: ${responseData.graph_stats?.nodes_created || 0}, 关系: ${responseData.graph_stats?.edges_created || 0})`, 'success');
-                addActivityLog(`为 ${character.name} 初始化会话成功 (${caller})`, 'success');
+                const nodes = responseData.graph_stats?.nodes_added ?? responseData.graph_stats?.nodes_created ?? 0;
+                const edges = responseData.graph_stats?.edges_added ?? responseData.graph_stats?.edges_created ?? 0;
+                showNotification(nodes === 0 ? responseData.message :
+                    `为 ${character.name} 初始化会话成功 (节点: ${nodes}, 关系: ${edges})`,
+                    nodes === 0 ? 'warning' : 'success');
+                addActivityLog(nodes === 0 ? responseData.message :
+                    `为 ${character.name} 初始化会话成功 (${caller})`,
+                    nodes === 0 ? 'warning' : 'success');
 
                 // Update UI if debug panel is open
                 updateDebugPanel();
@@ -1134,7 +1130,8 @@ jQuery(async () => {
 
             } catch (initError) {
                 console.error(`${PLUGIN_NAME}: Network error during session initialization:`, initError);
-                if (epoch !== sessionEpoch || (currentSessionId && isWsOpen())) return false;
+                if (epoch !== sessionEpoch) return false;
+                currentSessionId = null;
                 const message = initializationErrorMessage(initError);
                 showNotification(message, 'error');
                 addActivityLog(`${message} (${caller})`, 'error');
@@ -1142,7 +1139,8 @@ jQuery(async () => {
             }
         } catch (error) {
             console.error(`${PLUGIN_NAME}: Unexpected error during initialization:`, error);
-            if (epoch !== sessionEpoch || (currentSessionId && isWsOpen())) return false;
+            if (epoch !== sessionEpoch) return false;
+            currentSessionId = null;
             const message = initializationErrorMessage(error);
             showNotification(message, 'error');
             addActivityLog(`${message} (${caller})`, 'error');
