@@ -355,12 +355,12 @@ jQuery(async () => {
                 if (epoch !== sessionEpoch || !isWsOpen()) return reject(new Error('Session changed'));
                 const requestId = genRequestId();
                 const socket = webSocket;
-                const timer = setTimeout(() => {
+                const timer = timeoutMs > 0 ? setTimeout(() => {
                     if (pendingRequests.has(requestId)) {
                         pendingRequests.delete(requestId);
                         reject(new Error(`WS request timeout: ${action}`));
                     }
-                }, timeoutMs);
+                }, timeoutMs) : null;
                 pendingRequests.set(requestId, { resolve, reject, timer, socket, epoch });
                 try {
                     socket.send(JSON.stringify({ type: 'request', action, request_id: requestId, payload }));
@@ -380,7 +380,7 @@ jQuery(async () => {
             const waitForOpen = () => {
                 if (epoch !== sessionEpoch || webSocket !== socket) return reject(new Error('Session changed'));
                 if (socket.readyState === WebSocket.OPEN) return doSend();
-                if (socket.readyState !== WebSocket.CONNECTING || Date.now() - start >= Math.min(timeoutMs, 10000)) {
+                if (socket.readyState !== WebSocket.CONNECTING || Date.now() - start >= (timeoutMs > 0 ? Math.min(timeoutMs, 10000) : 10000)) {
                     return reject(new Error('WebSocket not connected'));
                 }
                 setTimeout(waitForOpen, 100);
@@ -1093,7 +1093,26 @@ jQuery(async () => {
             });
 
             try {
-                const responseData = await sendInitializationWsRequest('initialize', requestBody, 60000, requestBody.session_id, epoch); // 增加到60秒超时
+                // No fixed deadline: large world books can take several minutes.
+                // Poll state for a quiet activity update while the WS RPC remains pending.
+                const progressTimer = setInterval(async () => {
+                    if (epoch !== sessionEpoch) return;
+                    try {
+                        const progress = await fetch(`${pluginSettings.api_base_url}/tavern/current_session`,
+                            { signal: AbortSignal.timeout(5000) });
+                        if (progress.ok) {
+                            const state = await progress.json();
+                            if (state.initialization_status === 'initializing')
+                                addActivityLog(`知识图谱初始化仍在进行: ${character.name}`, 'info');
+                        }
+                    } catch (error) { logDebug('Initialization progress poll failed', error.message); }
+                }, 60000);
+                let responseData;
+                try {
+                    responseData = await sendInitializationWsRequest('initialize', requestBody, 0, requestBody.session_id, epoch);
+                } finally {
+                    clearInterval(progressTimer);
+                }
                 if (epoch !== sessionEpoch) return false;
                 logDebug('Initialization response received (WS)', {
                     sessionId: responseData.session_id,
@@ -1116,12 +1135,13 @@ jQuery(async () => {
 
                 const nodes = responseData.graph_stats?.nodes_added ?? responseData.graph_stats?.nodes_created ?? 0;
                 const edges = responseData.graph_stats?.edges_added ?? responseData.graph_stats?.edges_created ?? 0;
-                showNotification(nodes === 0 ? responseData.message :
-                    `为 ${character.name} 初始化会话成功 (节点: ${nodes}, 关系: ${edges})`,
-                    nodes === 0 ? 'warning' : 'success');
-                addActivityLog(nodes === 0 ? responseData.message :
-                    `为 ${character.name} 初始化会话成功 (${caller})`,
-                    nodes === 0 ? 'warning' : 'success');
+                const partial = responseData.graph_stats?.method === 'partial';
+                const resultMessage = partial
+                    ? `知识图谱部分完成 (${nodes} 个节点): ${responseData.graph_stats.reason || responseData.message}`
+                    : nodes === 0 ? responseData.message
+                    : `为 ${character.name} 初始化会话成功 (节点: ${nodes}, 关系: ${edges})`;
+                showNotification(resultMessage, partial || nodes === 0 ? 'warning' : 'success');
+                addActivityLog(resultMessage, partial || nodes === 0 ? 'warning' : 'success');
 
                 // Update UI if debug panel is open
                 updateDebugPanel();
@@ -2482,6 +2502,14 @@ jQuery(async () => {
                 // 获取当前上下文以检测角色变化
                 const context = getSillyTavernContext();
                 const currentCharacterId = context.characterId;
+                // Startup and CHAT_CHANGED can both fire for the same character.
+                // Keep the original WS request alive until it resolves.
+                if (initializationPromise && lastCharacterId === currentCharacterId) {
+                    activeChatKey = getChatKey(context);
+                    seedRenderedMessages(context);
+                    await initializationPromise;
+                    return;
+                }
                 const changedChat = switchChat(context);
                 if (!changedChat) seedRenderedMessages(context);
                 if (changedChat) {
