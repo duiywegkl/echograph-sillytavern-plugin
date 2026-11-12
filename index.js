@@ -143,7 +143,22 @@ jQuery(async () => {
                     addActivityLog(`知识图谱初始化完成 (节点: ${data.stats?.nodes_added || 0})`, 'success');
                     refreshPanelStats();
                 } else if (data.type === 'graph_updated') {
-                    addActivityLog(`知识图谱已更新 (总节点: ${data.total_nodes})`, 'info');
+                    if (data.source === 'manual_edit') {
+                        const actions = {
+                            node_created: '新增节点',
+                            node_updated: '编辑节点',
+                            node_deleted: '删除节点',
+                            relationship_created: '新增关系',
+                            relationship_updated: '编辑关系',
+                            relationship_deleted: '删除关系'
+                        };
+                        const label = actions[data.action];
+                        const target = String(data.target || '').replace('->', ' → ');
+                        addActivityLog(label ? `手动编辑：${label} ${target}` :
+                            `知识图谱已更新 (总节点: ${data.total_nodes})`, 'info');
+                    } else {
+                        addActivityLog(`知识图谱已更新 (总节点: ${data.total_nodes})`, 'info');
+                    }
                     refreshPanelStats();
                 } else if (data.type === 'connection_established') {
                     // no-op
