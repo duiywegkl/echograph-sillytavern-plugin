@@ -53,6 +53,12 @@ jQuery(async () => {
     let lastHealthOk = false; // 最近一次/当前健康检查是否成功，用于抑制在本地模式下的WS自动连接
     let reconnectTimer = null;
     let reconnectAttempt = 0;
+    let reconnectTarget = null;
+    let nextReconnectAt = 0;
+    let connectedAt = 0;
+    let notifiedConnectedChatKey;
+    let outageTimer = null;
+    let outageReported = false;
     let sessionEpoch = 0;
     const connectionTests = new Set();
     const processedMessages = new Map();
@@ -97,18 +103,23 @@ jQuery(async () => {
     function cancelReconnect() {
         if (reconnectTimer) clearTimeout(reconnectTimer);
         reconnectTimer = null;
+        reconnectTarget = null;
+        nextReconnectAt = 0;
     }
 
     function reconnectDelay(attempt) {
         return Math.min(30000, 1000 * 2 ** Math.min(attempt, 5));
     }
 
-    function scheduleReconnect() {
-        if (reconnectTimer || !pluginSettings?.enabled || !lastHealthOk || !currentSessionId) return;
+    function scheduleReconnect(sessionId) {
+        if (reconnectTimer || !pluginSettings?.enabled || !lastHealthOk || !sessionId) return;
         const delay = reconnectDelay(reconnectAttempt++);
+        reconnectTarget = sessionId;
+        nextReconnectAt = Date.now() + delay;
+        const epoch = sessionEpoch;
         reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
-            if (pluginSettings?.enabled && lastHealthOk && currentSessionId) connectWebSocket(currentSessionId);
+            if (epoch === sessionEpoch && pluginSettings?.enabled && lastHealthOk && reconnectTarget === sessionId) connectWebSocket(sessionId);
         }, delay);
     }
 
@@ -122,6 +133,7 @@ jQuery(async () => {
         if (!pluginSettings?.enabled || !sessionId) return;
         const encodedId = encodeURIComponent(sessionId || '');
         const wsUrl = `${pluginSettings.api_base_url.replace(/^http/, 'ws')}/ws/tavern/${encodedId}`;
+        if (reconnectTarget === sessionId && Date.now() < nextReconnectAt) return;
         cancelReconnect();
 
         // If there's an existing socket, avoid duplicate connects and close mismatched targets
@@ -147,8 +159,9 @@ jQuery(async () => {
                 webSocket = null;
                 rejectSocketRequests(oldSocket);
                 try { oldSocket.close(1001, 'Switching during connect'); } catch (e) {}
-            } else if (webSocket.readyState === WebSocket.CLOSING) {
-                logDebug(`[WS] Previous socket is closing; proceeding to open new to ${wsUrl}`);
+            } else if (webSocket.readyState >= WebSocket.CLOSING && sameTarget) {
+                logDebug(`[WS] Waiting for previous socket to close before reconnecting to ${wsUrl}`);
+                return;
             }
         }
 
@@ -157,16 +170,22 @@ jQuery(async () => {
 
         webSocket = new WebSocket(wsUrl);
         const thisSocket = webSocket;
+        connectedAt = 0;
         updateDrawerStatus();
 
         thisSocket.onopen = () => {
             if (webSocket !== thisSocket) return; // ignore stale
-            reconnectAttempt = 0;
+            connectedAt = Date.now();
             lastHealthOk = true;
             updateDrawerStatus();
             logDebug(`[WS] WebSocket connection established for session ${sessionId}`);
             console.log(`[EchoGraph WS] WebSocket connection established for session ${sessionId}`);
-            showNotification('EchoGraph 已连接', 'success');
+            addActivityLog('EchoGraph 已连接', 'success');
+            if (outageTimer) clearTimeout(outageTimer);
+            outageTimer = null;
+            if (notifiedConnectedChatKey !== activeChatKey || outageReported) showNotification('EchoGraph 已连接', 'success');
+            notifiedConnectedChatKey = activeChatKey;
+            outageReported = false;
             updatePanelStatus('已连接', 'connected');
         };
 
@@ -183,7 +202,11 @@ jQuery(async () => {
                         clearTimeout(entry.timer);
                         pendingRequests.delete(data.request_id);
                         if (data.ok) entry.resolve(data.data);
-                        else entry.reject(new Error(data.error?.message || 'WS error'));
+                        else {
+                            const error = new Error(data.error?.message || 'WS error');
+                            if (typeof data.error?.code === 'number') error.httpStatus = data.error.code;
+                            entry.reject(error);
+                        }
                     }
                     return;
                 }
@@ -263,19 +286,30 @@ jQuery(async () => {
             if (event?.code === 1008) lastHealthOk = false;
             logDebug(`[WS] WebSocket connection closed.`);
             console.log('[EchoGraph WS] WebSocket connection closed.');
-            showNotification('EchoGraph 已断开', 'warning');
+            addActivityLog('EchoGraph 已断开', 'warning');
+            if (connectedAt && Date.now() - connectedAt >= 10000) reconnectAttempt = 0;
+            if (!outageTimer && !outageReported) {
+                const epoch = sessionEpoch;
+                outageTimer = setTimeout(() => {
+                    outageTimer = null;
+                    if (epoch !== sessionEpoch || !pluginSettings?.enabled || isWsOpen() ||
+                        (currentSessionId && currentSessionId !== sessionId)) return;
+                    outageReported = true;
+                    showNotification('EchoGraph 已断开', 'warning');
+                }, 1500);
+            }
             updatePanelStatus('未连接', 'disconnected');
             // reject all pending requests
             rejectSocketRequests(thisSocket);
             webSocket = null;
             updateDrawerStatus();
-            scheduleReconnect();
+            scheduleReconnect(sessionId);
         };
 
         thisSocket.onerror = (error) => {
             if (webSocket !== thisSocket) return; // ignore stale error
             console.error('[WS] WebSocket error:', error);
-            showNotification('EchoGraph 连接错误', 'error');
+            addActivityLog('EchoGraph 连接错误', 'error');
             updatePanelStatus('错误', 'disconnected');
             try { thisSocket.close(); } catch (e) {}
         };
@@ -283,6 +317,10 @@ jQuery(async () => {
 
     function disconnectWebSocket() {
         cancelReconnect();
+        if (outageTimer) clearTimeout(outageTimer);
+        outageTimer = null;
+        outageReported = false;
+        reconnectAttempt = 0;
         if (webSocket) {
             logDebug('[WS] Manually disconnecting WebSocket.');
             rejectSocketRequests(webSocket);
@@ -343,6 +381,40 @@ jQuery(async () => {
             };
             waitForOpen();
         });
+    }
+
+    async function sendInitializationWsRequest(action, payload, timeoutMs, sessionId, epoch) {
+        try {
+            return await sendWsRequest(action, payload, timeoutMs);
+        } catch (error) {
+            if (!/WebSocket (closed|not connected)/.test(error.message) || epoch !== sessionEpoch) throw error;
+            await new Promise(resolve => setTimeout(resolve, reconnectDelay(Math.max(0, reconnectAttempt - 1)) + 100));
+            if (epoch !== sessionEpoch || !pluginSettings?.enabled) throw error;
+            connectWebSocket(sessionId);
+            return await sendWsRequest(action, payload, timeoutMs);
+        }
+    }
+
+    async function httpInitializationError(response) {
+        let detail = '';
+        try {
+            const body = await response.json();
+            detail = body.detail || body.error?.message || body.message || '';
+        } catch (e) { /* Status is still useful if the body is not JSON. */ }
+        const error = new Error(String(detail || response.statusText || '请求失败'));
+        error.httpStatus = response.status;
+        return error;
+    }
+
+    function initializationErrorMessage(error) {
+        if (error.httpStatus) return `会话初始化失败: 后端返回 HTTP ${error.httpStatus}: ${error.message}`;
+        if (error.name === 'TimeoutError' || error.message.startsWith('WS request timeout'))
+            return `会话初始化超时: ${error.message}`;
+        if (/WebSocket (closed|not connected)/.test(error.message))
+            return `会话初始化失败: WebSocket 连接已关闭 (${error.message})`;
+        if (error.name === 'TypeError' || /fetch|NetworkError/i.test(error.message))
+            return `会话初始化失败: 无法连接到 EchoGraph API (${pluginSettings.api_base_url})`;
+        return `会话初始化失败: ${error.message}`;
     }
 
 
@@ -905,12 +977,13 @@ jQuery(async () => {
 
         try {
             const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
-            if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
+            if (!modeResponse.ok) throw await httpInitializationError(modeResponse);
             const mode = await modeResponse.json();
             if (!mode.active) {
                 lastHealthOk = false;
                 updateDrawerStatus();
                 addActivityLog('EchoGraph 后台未启用酒馆模式', 'warning');
+                if (epoch === sessionEpoch) showNotification('会话初始化失败: EchoGraph 后台未启用酒馆模式', 'error');
                 return false;
             }
             lastHealthOk = true;
@@ -930,7 +1003,7 @@ jQuery(async () => {
 
             logDebug('Checking for existing tavern session via WS...');
             try {
-                const tavernSessionData = await sendWsRequest('tavern.current_session', {}, 10000);
+                const tavernSessionData = await sendInitializationWsRequest('tavern.current_session', {}, 10000, generateConsistentSessionId(character.name || ''), epoch);
                 if (epoch !== sessionEpoch) return false;
                 if (tavernSessionData && tavernSessionData.has_session) {
                     currentSessionId = tavernSessionData.session_id;
@@ -1030,7 +1103,7 @@ jQuery(async () => {
             });
 
             try {
-                const responseData = await sendWsRequest('initialize', requestBody, 60000); // 增加到60秒超时
+                const responseData = await sendInitializationWsRequest('initialize', requestBody, 60000, requestBody.session_id, epoch); // 增加到60秒超时
                 if (epoch !== sessionEpoch) return false;
                 logDebug('Initialization response received (WS)', {
                     sessionId: responseData.session_id,
@@ -1061,32 +1134,18 @@ jQuery(async () => {
 
             } catch (initError) {
                 console.error(`${PLUGIN_NAME}: Network error during session initialization:`, initError);
-
-                // 提供更详细的错误信息
-                let errorMessage = '会话初始化失败';
-                let detailMessage = '后端无法访问，请检查Python服务器是否正在运行。';
-
-                if (initError.name === 'TimeoutError') {
-                    errorMessage = '会话初始化超时';
-                    detailMessage = '初始化耗时过长（超过15秒）。这可能是因为：\n1. 后端服务器响应慢\n2. 网络连接问题\n3. 请求被拦截或阻止';
-                    console.error(`${PLUGIN_NAME}: [NEW VERSION] Initialization timeout after 15 seconds - 代码已更新`);
-                } else if (initError.name === 'AbortError') {
-                    errorMessage = '会话初始化被中止';
-                    detailMessage = '请求被取消或中止';
-                    console.error(`${PLUGIN_NAME}: Initialization request was aborted`);
-                } else if (initError.message.includes('fetch')) {
-                    errorMessage = '网络连接失败';
-                    detailMessage = `无法连接到EchoGraph API (${pluginSettings.api_base_url})`;
-                    console.error(`${PLUGIN_NAME}: Network connection failed:`, initError.message);
-                }
-
-                showNotification(`${errorMessage}: ${detailMessage}`, 'error');
-                addActivityLog(`${errorMessage} (${caller}): ${initError.message}`, 'error');
+                if (epoch !== sessionEpoch || (currentSessionId && isWsOpen())) return false;
+                const message = initializationErrorMessage(initError);
+                showNotification(message, 'error');
+                addActivityLog(`${message} (${caller})`, 'error');
                 return false;
             }
         } catch (error) {
             console.error(`${PLUGIN_NAME}: Unexpected error during initialization:`, error);
-            addActivityLog(`初始化意外错误 (${caller}): ${error.message}`, 'error');
+            if (epoch !== sessionEpoch || (currentSessionId && isWsOpen())) return false;
+            const message = initializationErrorMessage(error);
+            showNotification(message, 'error');
+            addActivityLog(`${message} (${caller})`, 'error');
             return false;
         } finally {
             if (epoch === sessionEpoch) isInitializing = false;
@@ -2353,7 +2412,7 @@ jQuery(async () => {
                         logDebug(`心跳检测成功 - 活跃会话: ${data.active_sessions}`);
 
                         // 更新连接状态指示器
-                        if (!isWsOpen() && currentSessionId) scheduleReconnect();
+                        if (!isWsOpen() && currentSessionId && !webSocket) scheduleReconnect(currentSessionId);
                         updatePanelStatus(isWsOpen() ? '已连接' : 'API 可用', isWsOpen() ? 'connected' : 'unknown');
 
                         // 如果主页面打开，更新API状态
