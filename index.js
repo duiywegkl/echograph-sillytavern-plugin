@@ -4,35 +4,13 @@
  * Based on analysis of st-memory-enhancement architecture
  */
 
-// 兼容性导入：优先使用全局对象，避免在不同SillyTavern版本/路径下模块导入失败导致插件整体无法加载
 const ST = (typeof window !== 'undefined' ? window : globalThis);
-const APP = ST.SillyTavern || ST.APP || {};
-// Robust event bus/type getters to adapt to different SillyTavern builds
-function getEventBus() {
-    // 优先尝试各种可能的事件源，包括SillyTavern的内部事件系统
-    if (ST.eventSource && typeof ST.eventSource.on === 'function') return ST.eventSource;
-    if (ST.SillyTavern?.eventSource && typeof ST.SillyTavern.eventSource.on === 'function') return ST.SillyTavern.eventSource;
-    if (APP?.eventSource && typeof APP.eventSource.on === 'function') return APP.eventSource;
-    // 尝试全局的eventSource
-    if (typeof window !== 'undefined' && window.eventSource && typeof window.eventSource.on === 'function') return window.eventSource;
-    // 最后回退到jQuery作为事件总线（SillyTavern经常使用jQuery事件）
-    return (typeof jQuery !== 'undefined' ? jQuery(document) : null);
-}
-function getEventTypes() {
-    return ST.event_types || APP?.event_types || ST.SillyTavern?.event_types || {};
-}
-const event_types = getEventTypes();
-const saveSettingsDebounced = ST?.saveSettingsDebounced || (() => {});
-const getRequestHeaders = ST?.getRequestHeaders || (() => ({}));
-const extension_settings = ST?.extension_settings || {};
-const getContext = ST?.getContext || (() => ({}));
-const renderExtensionTemplateAsync = ST?.renderExtensionTemplateAsync || (async () => '');
-const callGenericPopup = ST?.callGenericPopup || (() => {});
-const POPUP_TYPE = ST?.POPUP_TYPE || {};
-const power_user = ST?.power_user || {};
+const getContext = () => ST.SillyTavern.getContext();
 
 // 插件主逻辑包装在jQuery ready函数中，这是SillyTavern插件的标准做法
 jQuery(async () => {
+    if (ST.__echoGraphPluginLoaded) return;
+    ST.__echoGraphPluginLoaded = true;
     console.log("______________________EchoGraph插件：开始加载______________________");
 
     // --- Plugin Configuration ---
@@ -73,6 +51,65 @@ jQuery(async () => {
     let webSocket = null; // WebSocket 连接实例
 
     let lastHealthOk = false; // 最近一次/当前健康检查是否成功，用于抑制在本地模式下的WS自动连接
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+    let sessionEpoch = 0;
+    const processedMessages = new Map();
+    const renderedMessages = new Map();
+    const pendingPrompts = new WeakSet();
+    const messageIds = new WeakMap();
+    let nextMessageId = 0;
+    const clientInstanceId = Math.random().toString(36).slice(2);
+    let activeChatKey = null;
+    let generationType = null;
+
+    function getChatKey(context) {
+        const id = context.chatId ?? context.getCurrentChatId?.();
+        const owner = context.groupId ? `group:${context.groupId}` : `character:${context.characterId}`;
+        return `${owner}:${id ?? 'unknown'}`;
+    }
+
+    function messageKey(message) {
+        if (!messageIds.has(message)) messageIds.set(message, `${clientInstanceId}-${++nextMessageId}`);
+        return messageIds.get(message);
+    }
+
+    function switchChat(context) {
+        const key = getChatKey(context);
+        if (key === activeChatKey) return false;
+        activeChatKey = key;
+        sessionEpoch++;
+        processedMessages.clear();
+        seedRenderedMessages(context);
+        return true;
+    }
+
+    function seedRenderedMessages(context) {
+        renderedMessages.clear();
+        (context.chat || []).forEach((message) => {
+            if (message && !message.is_user) {
+                renderedMessages.set(messageKey(message), String(message.mes ?? message.content ?? ''));
+            }
+        });
+    }
+
+    function cancelReconnect() {
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    function reconnectDelay(attempt) {
+        return Math.min(30000, 1000 * 2 ** Math.min(attempt, 5));
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer || !pluginSettings?.enabled || !lastHealthOk || !currentSessionId) return;
+        const delay = reconnectDelay(reconnectAttempt++);
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (pluginSettings?.enabled && lastHealthOk && currentSessionId) connectWebSocket(currentSessionId);
+        }, delay);
+    }
 
 
 	    // 删除不再需要的事件绑定状态变量，因为使用了直接绑定方式
@@ -81,26 +118,34 @@ jQuery(async () => {
      * WebSocket Connection Management
      */
     function connectWebSocket(sessionId) {
+        if (!pluginSettings?.enabled || !sessionId) return;
         const encodedId = encodeURIComponent(sessionId || '');
         const wsUrl = `${pluginSettings.api_base_url.replace(/^http/, 'ws')}/ws/tavern/${encodedId}`;
+        cancelReconnect();
 
         // If there's an existing socket, avoid duplicate connects and close mismatched targets
         if (webSocket) {
-            const sameTarget = typeof webSocket.url === 'string' && webSocket.url.includes(encodedId);
+            const sameTarget = webSocket.url === wsUrl;
             if (webSocket.readyState === WebSocket.OPEN) {
                 if (sameTarget) {
                     logDebug(`[WS] WebSocket already connected for session ${sessionId}`);
                     return;
                 }
                 logDebug(`[WS] Closing open WebSocket to switch target...`);
-                try { webSocket.close(1000, 'Switching session'); } catch (e) {}
+                const oldSocket = webSocket;
+                webSocket = null;
+                rejectSocketRequests(oldSocket);
+                try { oldSocket.close(1000, 'Switching session'); } catch (e) {}
             } else if (webSocket.readyState === WebSocket.CONNECTING) {
                 if (sameTarget) {
                     logDebug(`[WS] Already connecting to target ${wsUrl}, skipping duplicate connect`);
                     return;
                 }
                 logDebug(`[WS] Closing connecting WebSocket to switch target...`);
-                try { webSocket.close(1001, 'Switching during connect'); } catch (e) {}
+                const oldSocket = webSocket;
+                webSocket = null;
+                rejectSocketRequests(oldSocket);
+                try { oldSocket.close(1001, 'Switching during connect'); } catch (e) {}
             } else if (webSocket.readyState === WebSocket.CLOSING) {
                 logDebug(`[WS] Previous socket is closing; proceeding to open new to ${wsUrl}`);
             }
@@ -114,6 +159,8 @@ jQuery(async () => {
 
         thisSocket.onopen = () => {
             if (webSocket !== thisSocket) return; // ignore stale
+            reconnectAttempt = 0;
+            lastHealthOk = true;
             logDebug(`[WS] WebSocket connection established for session ${sessionId}`);
             console.log(`[EchoGraph WS] WebSocket connection established for session ${sessionId}`);
             showNotification('EchoGraph 已连接', 'success');
@@ -129,7 +176,7 @@ jQuery(async () => {
                 // Handle WS RPC responses first
                 if (data.type === 'response' && data.request_id) {
                     const entry = pendingRequests.get(data.request_id);
-                    if (entry) {
+                    if (entry && entry.socket === thisSocket && entry.epoch === sessionEpoch) {
                         clearTimeout(entry.timer);
                         pendingRequests.delete(data.request_id);
                         if (data.ok) entry.resolve(data.data);
@@ -169,6 +216,7 @@ jQuery(async () => {
 
                     // 自动提交当前角色数据
                     setTimeout(async () => {
+                        if (webSocket !== thisSocket || (currentSessionId && sessionId !== currentSessionId)) return;
                         try {
                             logDebug('[WS] Auto-submitting current character data...');
                             const context = getSillyTavernContext();
@@ -207,22 +255,17 @@ jQuery(async () => {
             }
         };
 
-        thisSocket.onclose = () => {
+        thisSocket.onclose = (event) => {
             if (webSocket !== thisSocket) return; // ignore stale close
+            if (event?.code === 1008) lastHealthOk = false;
             logDebug(`[WS] WebSocket connection closed.`);
             console.log('[EchoGraph WS] WebSocket connection closed.');
             showNotification('EchoGraph 已断开', 'warning');
             updatePanelStatus('未连接', 'disconnected');
             // reject all pending requests
-            try {
-                pendingRequests.forEach(({ reject, timer }, id) => {
-                    clearTimeout(timer);
-                    reject(new Error('WebSocket closed'));
-                });
-            } finally {
-                pendingRequests.clear();
-            }
+            rejectSocketRequests(thisSocket);
             webSocket = null;
+            scheduleReconnect();
         };
 
         thisSocket.onerror = (error) => {
@@ -230,34 +273,47 @@ jQuery(async () => {
             console.error('[WS] WebSocket error:', error);
             showNotification('EchoGraph 连接错误', 'error');
             updatePanelStatus('错误', 'disconnected');
-            webSocket = null;
+            try { thisSocket.close(); } catch (e) {}
         };
     }
 
     function disconnectWebSocket() {
+        cancelReconnect();
         if (webSocket) {
             logDebug('[WS] Manually disconnecting WebSocket.');
+            rejectSocketRequests(webSocket);
             webSocket.close();
             webSocket = null;
         }
     }
     // --- WS RPC helpers ---
     const pendingRequests = new Map();
+    function rejectSocketRequests(socket) {
+        for (const [id, entry] of pendingRequests) {
+            if (entry.socket !== socket) continue;
+            clearTimeout(entry.timer);
+            pendingRequests.delete(id);
+            entry.reject(new Error('WebSocket closed'));
+        }
+    }
     function genRequestId() { return `${Date.now()}-${Math.random().toString(36).slice(2,8)}`; }
     function isWsOpen() { return webSocket && webSocket.readyState === WebSocket.OPEN; }
     function sendWsRequest(action, payload = {}, timeoutMs = 20000) {
         return new Promise((resolve, reject) => {
+            const epoch = sessionEpoch;
             const doSend = () => {
+                if (epoch !== sessionEpoch || !isWsOpen()) return reject(new Error('Session changed'));
                 const requestId = genRequestId();
+                const socket = webSocket;
                 const timer = setTimeout(() => {
                     if (pendingRequests.has(requestId)) {
                         pendingRequests.delete(requestId);
                         reject(new Error(`WS request timeout: ${action}`));
                     }
                 }, timeoutMs);
-                pendingRequests.set(requestId, { resolve, reject, timer });
+                pendingRequests.set(requestId, { resolve, reject, timer, socket, epoch });
                 try {
-                    webSocket.send(JSON.stringify({ type: 'request', action, request_id: requestId, payload }));
+                    socket.send(JSON.stringify({ type: 'request', action, request_id: requestId, payload }));
                 } catch (e) {
                     clearTimeout(timer);
                     pendingRequests.delete(requestId);
@@ -265,46 +321,21 @@ jQuery(async () => {
                 }
             };
 
-            // Auto-connect if possible
-            if ((!webSocket || webSocket.readyState === WebSocket.CLOSED) && currentSessionId) {
-                if (lastHealthOk) { try { connectWebSocket(currentSessionId); } catch (e) {} }
-            }
-
-            if (isWsOpen()) {
-                return doSend();
-            }
-            // If the socket is connecting, wait for it to open
-            if (webSocket && webSocket.readyState === WebSocket.CONNECTING) {
-                console.log('[EchoGraph WS] Waiting for WebSocket to open before sending request:', action);
-                const start = Date.now();
-                const maxWait = Math.min(timeoutMs - 1000, 10000);
-                const waitForOpen = () => {
-                    if (isWsOpen()) return doSend();
-                    if (Date.now() - start > maxWait) {
-                        return reject(new Error('WebSocket not connected'));
-                    }
-                    setTimeout(waitForOpen, 100);
-                };
-                return waitForOpen();
-            }
-
-            // As a last attempt, try to connect if we have a session id
-            if (currentSessionId) {
-                if (lastHealthOk) { try { connectWebSocket(currentSessionId); } catch (e) {} }
-                // brief delay then attempt to wait again
-                const start = Date.now();
-                const maxWait = Math.min(timeoutMs - 1000, 8000);
-                const waitForOpen2 = () => {
-                    if (isWsOpen()) return doSend();
-                    if (Date.now() - start > maxWait) {
-                        return reject(new Error('WebSocket not connected'));
-                    }
-                    setTimeout(waitForOpen2, 100);
-                };
-                return waitForOpen2();
-            }
-
-            return reject(new Error('WebSocket not connected'));
+            if (!webSocket && currentSessionId && lastHealthOk) connectWebSocket(currentSessionId);
+            const socket = webSocket;
+            if (!socket) return reject(new Error('WebSocket not connected'));
+            if (socket.readyState === WebSocket.OPEN) return doSend();
+            if (socket.readyState !== WebSocket.CONNECTING) return reject(new Error('WebSocket not connected'));
+            const start = Date.now();
+            const waitForOpen = () => {
+                if (epoch !== sessionEpoch || webSocket !== socket) return reject(new Error('Session changed'));
+                if (socket.readyState === WebSocket.OPEN) return doSend();
+                if (socket.readyState !== WebSocket.CONNECTING || Date.now() - start >= Math.min(timeoutMs, 10000)) {
+                    return reject(new Error('WebSocket not connected'));
+                }
+                setTimeout(waitForOpen, 100);
+            };
+            waitForOpen();
         });
     }
 
@@ -467,14 +498,15 @@ jQuery(async () => {
     // --- Utility Functions ---
     function loadSettings() {
         // 使用标准的SillyTavern扩展设置系统
-        pluginSettings = Object.assign({}, DEFAULT_SETTINGS, extension_settings[SETTINGS_KEY] || {});
+        pluginSettings = Object.assign({}, DEFAULT_SETTINGS, getContext().extensionSettings[SETTINGS_KEY] || {});
         return pluginSettings;
     }
 
     function saveSettings() {
         // 使用SillyTavern标准的设置保存方式
-        extension_settings[SETTINGS_KEY] = pluginSettings;
-        saveSettingsDebounced();
+        const context = getContext();
+        context.extensionSettings[SETTINGS_KEY] = pluginSettings;
+        context.saveSettingsDebounced();
     }
 
     function truncateValue(val, maxLen = 200) {
@@ -491,6 +523,9 @@ jQuery(async () => {
             console.log(`[${PLUGIN_NAME} Debug]`, truncateValue(message, 200), ...truncated, '（详细见服务器日志 logs/api_server_YYYY-MM-DD.log / logs/llm_YYYY-MM-DD.log）');
         }
     }
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+    }
 
     function showNotification(message, type = 'info') {
         if (pluginSettings?.show_notifications) {
@@ -503,61 +538,32 @@ jQuery(async () => {
      */
     function getSillyTavernContext() {
         try {
-            console.log("🔍 [EchoGraph] ========== 开始获取SillyTavern上下文 ==========");
+            console.log("[EchoGraph] ========== 开始获取SillyTavern上下文 ==========");
 
-            // 优先使用 APP.getContext，其次是 SillyTavern.getContext，最后回退到全局 getContext
-            let context = null;
-
-            // 方法1: 使用 APP.getContext()（参考 st-memory-enhancement 的做法）
-            if (APP && typeof APP.getContext === 'function') {
-                context = APP.getContext();
-                console.log('✅ [EchoGraph] 角色上下文来源: APP.getContext()', {
-                    success: true,
-                    hasContext: !!context
-                });
-            }
-            // 方法2: 使用 SillyTavern.getContext()
-            else if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
-                context = SillyTavern.getContext();
-                console.log('✅ [EchoGraph] 角色上下文来源: SillyTavern.getContext()', {
-                    success: true,
-                    hasContext: !!context
-                });
-            }
-            // 方法3: 回退到全局 getContext（老版本兼容）
-            else if (typeof getContext !== 'undefined') {
-                context = getContext();
-                console.log('✅ [EchoGraph] 角色上下文来源: 全局getContext()', {
-                    success: true,
-                    hasContext: !!context
-                });
-            }
+            const context = getContext();
+            console.log('[EchoGraph] Character context source: SillyTavern.getContext()', {
+                success: true,
+                hasContext: !!context
+            });
 
             if (!context) {
-                console.error('❌ [EchoGraph] 无法获取SillyTavern上下文');
+                console.error('[EchoGraph] 无法获取SillyTavern上下文');
                 return {
                     characterId: null,
                     characters: {},
                     chat: [],
                     worldInfoData: null,
-                    extensionSettings: extension_settings || {}
+                    extensionSettings: {}
                 };
             }
 
-            // 多种方式获取当前角色ID，参考最新文档
+            // 从 SillyTavern 上下文获取当前角色 ID
             let characterId = null;
 
-            // 方法1: 从context.characterId获取（标准方式）
             // 修复：0是有效的characterId，不应该被排除
             if (context.characterId !== undefined && context.characterId !== null && context.characterId !== -1 && context.characterId !== '') {
                 characterId = context.characterId;
-                console.log('✅ [EchoGraph] 角色ID来源: context.characterId', characterId);
-            }
-            // 方法2: 从全局变量this_chid获取（备用方式）
-            // 修复：0是有效的this_chid，不应该被排除
-            else if (typeof this_chid !== 'undefined' && this_chid !== null && this_chid !== -1 && this_chid !== '') {
-                characterId = this_chid;
-                console.log('✅ [EchoGraph] 角色ID来源: 全局this_chid', characterId);
+                console.log('[EchoGraph] 角色ID来源: context.characterId', characterId);
             }
 
             // 获取角色数据，支持多种数据结构
@@ -575,7 +581,7 @@ jQuery(async () => {
             }
 
             // 详细日志记录
-            console.log('📊 [EchoGraph] 上下文信息详细分析', {
+            console.log('[EchoGraph] 上下文信息详细分析', {
                 characterId: characterId,
                 characterIdType: typeof characterId,
                 hasValidCharacterId: characterId !== null && characterId !== undefined && characterId !== -1 && characterId !== '',
@@ -595,7 +601,7 @@ jQuery(async () => {
 
             // 检查是否在群聊模式（群聊时characterId会是undefined）
             if (context.groupId !== undefined && context.groupId !== null) {
-                console.warn('⚠️ [EchoGraph] 检测到群聊模式，角色ID可能无效', {
+                console.warn('[EchoGraph] 检测到群聊模式，角色ID可能无效', {
                     groupId: context.groupId,
                     characterId: characterId
                 });
@@ -606,7 +612,7 @@ jQuery(async () => {
             if (characterId !== null && characterId !== undefined && characterId !== -1 && characterId !== '') {
                 const character = characters[characterId];
                 if (character) {
-                    console.log('🎭 [EchoGraph] 当前角色详细信息', {
+                    console.log('[EchoGraph] 当前角色详细信息', {
                         id: characterId,
                         name: character.name || 'Unknown',
                         hasDescription: !!character.description,
@@ -627,23 +633,23 @@ jQuery(async () => {
 
                     // 显示角色描述预览
                     if (character.description) {
-                        console.log('📝 [EchoGraph] 角色描述预览:', character.description.substring(0, 200) + (character.description.length > 200 ? '...' : ''));
+                        console.log('[EchoGraph] 角色描述预览:', character.description.substring(0, 200) + (character.description.length > 200 ? '...' : ''));
                     }
                     if (character.personality) {
-                        console.log('🧠 [EchoGraph] 角色个性预览:', character.personality.substring(0, 200) + (character.personality.length > 200) ? '...' : '');
+                        console.log('[EchoGraph] 角色个性预览:', character.personality.substring(0, 200) + (character.personality.length > 200) ? '...' : '');
                     }
                     if (character.scenario) {
-                        console.log('🎬 [EchoGraph] 角色场景预览:', character.scenario.substring(0, 200) + (character.scenario.length > 200 ? '...' : ''));
+                        console.log('[EchoGraph] 角色场景预览:', character.scenario.substring(0, 200) + (character.scenario.length > 200 ? '...' : ''));
                     }
                 } else {
-                    console.warn('⚠️ [EchoGraph] 警告: 角色ID存在但无角色数据', {
+                    console.warn('[EchoGraph] 警告: 角色ID存在但无角色数据', {
                         characterId: characterId,
                         availableCharacterIds: Object.keys(characters || {}),
                         charactersType: typeof characters
                     });
                 }
             } else {
-                console.info('ℹ️ [EchoGraph] 当前没有选中有效角色', {
+                console.info('[EchoGraph] 当前没有选中有效角色', {
                     characterId: characterId,
                     isGroupChat: !!context.groupId,
                     availableCharacters: Object.keys(characters || {}).length,
@@ -652,14 +658,14 @@ jQuery(async () => {
 
                 // 如果没有角色但有角色列表，显示可用角色
                 if (Object.keys(characters || {}).length > 0) {
-                    console.log('📋 [EchoGraph] 可用角色列表:');
+                    console.log('[EchoGraph] 可用角色列表:');
                     Object.entries(characters).forEach(([id, char]) => {
-                        console.log(`  - ID: ${id}, 名称: ${char.name || 'Unknown'}`);
+                        console.log(`- ID: ${id}, 名称: ${char.name || 'Unknown'}`);
                     });
                 }
             }
 
-            console.log("✅ [EchoGraph] ========== 上下文获取完成 ==========");
+            console.log("[EchoGraph] ========== 上下文获取完成 ==========");
 
             return {
                 characterId: characterId,
@@ -667,12 +673,12 @@ jQuery(async () => {
                 chat: context.chat || [],
                 worldInfoData: worldInfoData,
                 groupId: context.groupId,
-                extensionSettings: extension_settings || {},
+                extensionSettings: context.extensionSettings || {},
                 ...context
             };
         } catch (error) {
-            console.error(`❌ [EchoGraph] Error getting context:`, error);
-            console.error('💥 [EchoGraph] 获取上下文失败', {
+            console.error(`[EchoGraph] Error getting context:`, error);
+            console.error('[EchoGraph] 获取上下文失败', {
                 error: error.message,
                 stack: error.stack
             });
@@ -681,7 +687,7 @@ jQuery(async () => {
                 characters: {},
                 chat: [],
                 worldInfoData: null,
-                extensionSettings: extension_settings || {}
+                extensionSettings: {}
             };
         }
     }
@@ -690,9 +696,10 @@ jQuery(async () => {
      * Submit character data to the backend for use by initialization process
      */
     async function submitCharacterDataToBackend(characterId, character) {
+        const epoch = sessionEpoch;
         try {
-            console.log('🎭 [EchoGraph] ========== 开始提交角色数据到后台 ==========');
-            console.log('🎭 [EchoGraph] 提交参数:', {
+            console.log('[EchoGraph] ========== 开始提交角色数据到后台 ==========');
+            console.log('[EchoGraph] 提交参数:', {
                 characterId: characterId,
                 characterName: character.name || 'Unknown',
                 hasData: !!character
@@ -701,6 +708,7 @@ jQuery(async () => {
             // 获取上下文，包含世界书信息
             const context = getSillyTavernContext();
             const worldInfo = await getEnhancedWorldInfo(context);
+            if (epoch !== sessionEpoch) return false;
 
             // 构建完整的角色数据，包含世界书
             const characterData = {
@@ -711,20 +719,20 @@ jQuery(async () => {
                 first_mes: character.first_mes || character.data?.first_mes || '',
                 mes_example: character.mes_example || character.data?.mes_example || '',
                 avatar: character.avatar || '',
-                world_info: worldInfo, // 🔥 关键修复：包含世界书信息
+                world_info: worldInfo, //  关键修复：包含世界书信息
                 // 包含所有原始数据，以防有遗漏的字段
                 raw_character: character,
                 raw_data: character.data || {}
             };
 
-            console.log('🎭 [EchoGraph] 完整角色数据:', {
+            console.log('[EchoGraph] 完整角色数据:', {
                 name: characterData.name,
                 descriptionLength: characterData.description.length,
                 personalityLength: characterData.personality.length,
                 scenarioLength: characterData.scenario.length,
                 firstMesLength: characterData.first_mes.length,
                 exampleLength: characterData.mes_example.length,
-                worldInfoLength: characterData.world_info.length, // 🔥 添加世界书长度日志
+                worldInfoLength: characterData.world_info.length, //  添加世界书长度日志
                 hasAvatar: !!characterData.avatar,
                 rawCharacterKeys: Object.keys(character),
                 rawDataKeys: Object.keys(character.data || {})
@@ -732,18 +740,18 @@ jQuery(async () => {
 
             // 记录每个重要字段的预览
             if (characterData.description) {
-                console.log('📝 [EchoGraph] 描述预览:', characterData.description.substring(0, 200));
+                console.log('[EchoGraph] 描述预览:', characterData.description.substring(0, 200));
             }
             if (characterData.personality) {
-                console.log('🧠 [EchoGraph] 个性预览:', characterData.personality.substring(0, 200));
+                console.log('[EchoGraph] 个性预览:', characterData.personality.substring(0, 200));
             }
             if (characterData.scenario) {
-                console.log('🎬 [EchoGraph] 场景预览:', characterData.scenario.substring(0, 200));
+                console.log('[EchoGraph] 场景预览:', characterData.scenario.substring(0, 200));
             }
             if (characterData.world_info && characterData.world_info.length > 0) {
-                console.log('🌍 [EchoGraph] 世界书预览:', characterData.world_info.substring(0, 200));
+                console.log('[EchoGraph] 世界书预览:', characterData.world_info.substring(0, 200));
             } else {
-                console.log('⚠️ [EchoGraph] 世界书为空或未获取到');
+                console.log('[EchoGraph] 世界书为空或未获取到');
             }
 
             // 发送到后台API
@@ -755,9 +763,10 @@ jQuery(async () => {
             };
 
             // 确保先建立WS连接（使用该角色的一致会话ID）
+            if (epoch !== sessionEpoch) return false;
             ensureWsForCharacter(characterData.name, {force: true});
 
-            console.log('🚀 [EchoGraph] 发送角色数据到后台(WS):', {
+            console.log('[EchoGraph] 发送角色数据到后台(WS):', {
                 action: 'tavern.submit_character',
                 character_id: submitRequest.character_id,
                 character_name: submitRequest.character_name,
@@ -766,7 +775,7 @@ jQuery(async () => {
 
             try {
                 const result = await sendWsRequest('tavern.submit_character', submitRequest, 10000);
-                console.log('✅ [EchoGraph] 角色数据提交成功:', result);
+                console.log('[EchoGraph] 角色数据提交成功:', result);
                 logDebug('Character data submitted successfully', {
                     characterId: characterId,
                     characterName: characterData.name,
@@ -775,17 +784,17 @@ jQuery(async () => {
                 });
                 return true;
             } catch (e) {
-                console.error('❌ [EchoGraph] 角色数据提交失败(WS):', e);
+                console.error('[EchoGraph] 角色数据提交失败(WS):', e);
                 logDebug('Character data submission failed', { error: e?.message });
                 return false;
             }
 
         } catch (error) {
-            console.error('💥 [EchoGraph] 角色数据提交异常:', error);
+            console.error('[EchoGraph] 角色数据提交异常:', error);
             logDebug('Character data submission exception', error);
             return false;
         } finally {
-            console.log('🎭 [EchoGraph] ========== 角色数据提交流程结束 ==========');
+            console.log('[EchoGraph] ========== 角色数据提交流程结束 ==========');
         }
     }
 
@@ -794,6 +803,7 @@ jQuery(async () => {
      */
     async function initializeSession(caller = 'unknown', forceReinit = false) {
         logDebug(`initializeSession called by: ${caller}, force: ${forceReinit}`);
+        const epoch = sessionEpoch;
 
         // 如果已经在初始化，返回现有的Promise（除非强制重新初始化）
         if (initializationPromise && !forceReinit) {
@@ -803,16 +813,18 @@ jQuery(async () => {
 
         // 创建新的初始化Promise
         initializationPromise = performInitialization(caller, forceReinit);
+        const thisPromise = initializationPromise;
 
         try {
-            const result = await initializationPromise;
-            return result;
+            const result = await thisPromise;
+            return epoch === sessionEpoch ? result : false;
         } finally {
-            initializationPromise = null; // 清除Promise，允许后续初始化
+            if (initializationPromise === thisPromise) initializationPromise = null;
         }
     }
 
     async function performInitialization(caller, forceReinit = false) {
+        const epoch = sessionEpoch;
         if (isInitializing && !forceReinit) {
             logDebug('Session initialization already in progress, skipping...');
             return false;
@@ -884,6 +896,16 @@ jQuery(async () => {
         lastCharacterId = characterId;
 
         try {
+            const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+            if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
+            const mode = await modeResponse.json();
+            if (!mode.active) {
+                lastHealthOk = false;
+                addActivityLog('EchoGraph 后台未启用酒馆模式', 'warning');
+                return false;
+            }
+            lastHealthOk = true;
+            if (epoch !== sessionEpoch) return false;
             logDebug('Initializing new session...', {
                 characterId: characterId,
                 characterName: character.name || 'Unnamed'
@@ -899,6 +921,7 @@ jQuery(async () => {
             logDebug('Checking for existing tavern session via WS...');
             try {
                 const tavernSessionData = await sendWsRequest('tavern.current_session', {}, 10000);
+                if (epoch !== sessionEpoch) return false;
                 if (tavernSessionData && tavernSessionData.has_session) {
                     currentSessionId = tavernSessionData.session_id;
                     const hasNodes = (tavernSessionData.graph_nodes || 0) > 0;
@@ -916,8 +939,9 @@ jQuery(async () => {
                     if (!hasNodes) {
                         logDebug('Existing session found but empty (no nodes), submitting character data...');
 
-                        // 💡 关键修复：向空会话提交角色数据
+                        //  关键修复：向空会话提交角色数据
                         const submitSuccess = await submitCharacterDataToBackend(characterId, character);
+                        if (epoch !== sessionEpoch) return false;
                         if (submitSuccess) {
                             logDebug('Character data submitted to existing empty session');
                             addActivityLog(`角色数据已提交到现有会话: ${character.name}`, 'success');
@@ -954,6 +978,7 @@ jQuery(async () => {
 
             // 获取增强的世界书信息
             const worldInfo = await getEnhancedWorldInfo(context);
+            if (epoch !== sessionEpoch) return false;
 
             logDebug('Extracted character data', {
                 characterName: characterData.name,
@@ -963,9 +988,10 @@ jQuery(async () => {
                 worldInfoLength: worldInfo.length
             });
 
-            // 💡 关键修复：首先向后台提交角色数据，供初始化流程使用
+            //  关键修复：首先向后台提交角色数据，供初始化流程使用
             logDebug('Submitting character data to backend before initialization...');
             const submitSuccess = await submitCharacterDataToBackend(characterId, character);
+            if (epoch !== sessionEpoch) return false;
 
             if (!submitSuccess) {
                 logDebug('Character data submission failed, but continuing with initialization...');
@@ -995,6 +1021,7 @@ jQuery(async () => {
 
             try {
                 const responseData = await sendWsRequest('initialize', requestBody, 60000); // 增加到60秒超时
+                if (epoch !== sessionEpoch) return false;
                 logDebug('Initialization response received (WS)', {
                     sessionId: responseData.session_id,
                     message: responseData.message,
@@ -1052,7 +1079,7 @@ jQuery(async () => {
             addActivityLog(`初始化意外错误 (${caller}): ${error.message}`, 'error');
             return false;
         } finally {
-            isInitializing = false;
+            if (epoch === sessionEpoch) isInitializing = false;
         }
     }
 
@@ -1063,15 +1090,15 @@ jQuery(async () => {
         let worldInfo = '';
         let sources = [];
 
-        console.log('[EchoGraph] 🌍 开始提取世界书信息');
+        console.log('[EchoGraph]  开始提取世界书信息');
 
         try {
-            if (typeof SillyTavern !== 'undefined' && SillyTavern.getContext) {
-                const stContext = SillyTavern.getContext();
+            if (context) {
+                const stContext = context;
 
                 // 使用官方的getWorldInfoPrompt函数
                 if (typeof stContext.getWorldInfoPrompt === 'function') {
-                    console.log('[EchoGraph] 🔧 调用官方getWorldInfoPrompt函数...');
+                    console.log('[EchoGraph]  调用官方getWorldInfoPrompt函数...');
 
                     try {
                         // getWorldInfoPrompt需要正确格式的消息数组
@@ -1093,13 +1120,13 @@ jQuery(async () => {
                         if (worldInfoResult && typeof worldInfoResult === 'string' && worldInfoResult.trim()) {
                             worldInfo += worldInfoResult;
                             sources.push('official_getWorldInfoPrompt');
-                            console.log('[EchoGraph] ✅ 从官方API获取到世界书内容:', worldInfoResult.length, '字符');
+                            console.log('[EchoGraph]  从官方API获取到世界书内容:', worldInfoResult.length, '字符');
                         } else {
-                            console.log('[EchoGraph] ⚠️ getWorldInfoPrompt返回空结果');
+                            console.log('[EchoGraph]  getWorldInfoPrompt返回空结果');
                         }
 
                     } catch (promptError) {
-                        console.log('[EchoGraph] ⚠️ getWorldInfoPrompt调用失败，尝试其他方法:', promptError.message);
+                        console.log('[EchoGraph]  getWorldInfoPrompt调用失败，尝试其他方法:', promptError.message);
                     }
                 }
 
@@ -1125,7 +1152,7 @@ jQuery(async () => {
 
                                 worldInfo += worldInfo ? '\n\n' + worldContent : worldContent;
                                 sources.push(`character_${field}: ${entries.length} entries`);
-                                console.log(`[EchoGraph] ✅ 从角色 ${field} 获取到世界书内容:`, worldContent.length, '字符');
+                                console.log(`[EchoGraph]  从角色 ${field} 获取到世界书内容:`, worldContent.length, '字符');
                             }
                         }
                     });
@@ -1150,12 +1177,12 @@ jQuery(async () => {
                 if (activeEntries.length > 0) {
                     worldInfo += activeEntries.join('\n\n');
                     sources.push(`context_world_info_entries: ${activeEntries.length}`);
-                    console.log(`[EchoGraph] ✅ 备用方法：已添加 ${activeEntries.length} 个世界书条目`);
+                    console.log(`[EchoGraph]  备用方法：已添加 ${activeEntries.length} 个世界书条目`);
                 }
             }
 
         } catch (error) {
-            console.error('[EchoGraph] ❌ 世界书信息提取错误:', error);
+            console.error('[EchoGraph]  世界书信息提取错误:', error);
         }
 
         const finalStats = {
@@ -1164,7 +1191,7 @@ jQuery(async () => {
             来源数量: sources.length
         };
 
-        console.log('[EchoGraph] 🎯 世界信息提取完成', finalStats);
+        console.log('[EchoGraph]  世界信息提取完成', finalStats);
         return worldInfo || 'No world information available.';
     }
 
@@ -1172,24 +1199,34 @@ jQuery(async () => {
      * Enhanced prompt processing with better context management
      */
     async function onChatCompletionPromptReady(eventData) {
-        if (!pluginSettings?.enabled || eventData.dryRun) return;
+        // ST also emits this event for dry runs and quiet/background generations.
+        if (!pluginSettings?.enabled || !Array.isArray(eventData?.chat) || eventData.dryRun || !generationType || generationType === 'quiet' || generationType === 'impersonate') return;
+        if (pendingPrompts.has(eventData)) return;
+        if (eventData.chat.some(msg => msg?.role === 'system' && typeof msg.content === 'string' && msg.content.startsWith('[EchoGraph Enhanced Context]\n'))) return;
+        // One foreground chat-completion prompt per generation. Raw/background calls
+        // do not emit GENERATION_STARTED and must not inherit this generation type.
+        generationType = null;
+        pendingPrompts.add(eventData);
+        const epoch = sessionEpoch;
 
         if (!currentSessionId) {
             logDebug('No active session ID, attempting auto-initialization...');
             if (pluginSettings.auto_initialize) {
-                const initResult = await initializeSession('manual_enhance_prompt');
-                if (!initResult) {
-                    logDebug('Failed to initialize session for prompt enhancement');
-                    return;
-                }
+                void initializeSession('manual_enhance_prompt');
             } else {
                 logDebug(`${PLUGIN_NAME}: No active session ID and auto-init disabled. Enhancement skipped.`);
-                return;
             }
+            pendingPrompts.delete(eventData);
+            return;
+        }
+        if (!isWsOpen()) {
+            pendingPrompts.delete(eventData);
+            return;
         }
 
         try {
-            const userMessage = eventData.chat.slice().reverse().find(msg => msg.role === 'user');
+            const userIndex = eventData.chat.findLastIndex(msg => msg?.role === 'user' && msg.content);
+            const userMessage = eventData.chat[userIndex];
             if (!userMessage || !userMessage.content) {
                 logDebug('No user message found in chat');
                 return;
@@ -1211,12 +1248,13 @@ jQuery(async () => {
                 user_input: userInput,
                 recent_history: recentHistory,
                 max_context_length: pluginSettings.max_context_length
-            }, 20000);
+            }, 3000);
+            if (epoch !== sessionEpoch) return;
             const enhancedContext = data.enhanced_context;
 
             if (enhancedContext && enhancedContext.trim().length > 0) {
                 // Insert enhanced context as system message before the last user message
-                eventData.chat.splice(-1, 0, {
+                eventData.chat.splice(userIndex, 0, {
                     role: 'system',
                     content: `[EchoGraph Enhanced Context]\n${enhancedContext}`
                 });
@@ -1234,6 +1272,8 @@ jQuery(async () => {
         } catch (error) {
             console.error(`${PLUGIN_NAME}: Error during prompt enhancement:`, error);
             showNotification('增强失败：' + error.message, 'error');
+        } finally {
+            pendingPrompts.delete(eventData);
         }
     }
 
@@ -1291,14 +1331,17 @@ jQuery(async () => {
     /**
      * Enhanced conversation processing with sliding window system
      */
-    async function onMessageReceived(chat_id) {
+    async function onMessageReceived(chat_id, type) {
+        if (type === 'first_message') return;
         if (!pluginSettings?.enabled || !currentSessionId) {
             logDebug('对话处理已跳过 - 插件已禁用或无会话');
             return;
         }
 
+        let key;
         try {
             const context = getSillyTavernContext();
+            const epoch = sessionEpoch;
             const message = context.chat[chat_id];
 
             if (!message || message.is_user) {
@@ -1315,6 +1358,16 @@ jQuery(async () => {
                 return;
             }
 
+            key = messageKey(message);
+            const previous = renderedMessages.get(key);
+            if (previous === llmResponse || processedMessages.get(key) === llmResponse) return;
+            renderedMessages.set(key, llmResponse);
+            if (previous !== undefined) {
+                await syncConversationState();
+                return;
+            }
+            processedMessages.set(key, llmResponse);
+
             logDebug('处理新对话轮次 - 滑动窗口系统', {
                 userInputLength: userInput.length,
                 llmResponseLength: llmResponse.length
@@ -1327,8 +1380,10 @@ jQuery(async () => {
                 llm_response: llmResponse,
                 timestamp: new Date().toISOString(),
                 chat_id: chat_id,
-                tavern_message_id: String(message.message_id || chat_id || 'unknown')
+                tavern_chat_id: getChatKey(context),
+                tavern_message_id: key
             }, 25000);
+            if (epoch !== sessionEpoch) return;
             logDebug('滑动窗口对话处理成功', {
                 turnProcessed: data.turn_processed,
                 targetProcessed: data.target_processed,
@@ -1352,6 +1407,10 @@ jQuery(async () => {
             updateDebugPanel();
 
         } catch (error) {
+            if (key) {
+                processedMessages.delete(key);
+                renderedMessages.delete(key);
+            }
             console.error(`${PLUGIN_NAME}: 对话处理时发生错误:`, error);
             addActivityLog('对话处理错误: ' + error.message, 'error');
         }
@@ -1359,125 +1418,108 @@ jQuery(async () => {
 
     // --- UI Creation Functions ---
     function createSettingsModal() {
+        if ($('#echograph-settings-modal').length) {
+            $('#echograph-settings-modal').show();
+            loadSettingsToModal();
+            return;
+        }
         const modalHtml = `
-            <div id="echograph-settings-modal" style="
-                position: absolute;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0,0,0,0.8);
-                display: none;
-                z-index: 100;
-                justify-content: center;
-                align-items: center;
-            ">
-                <div style="
-                    background: var(--SmartThemeBodyColor);
-                    border: 1px solid var(--SmartThemeBorderColor);
-                    border-radius: 10px;
-                    width: 90%;
-                    max-width: 700px;
-                    max-height: 80%;
-                    overflow-y: auto;
-                    padding: 20px;
-                    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-                    position: relative;
-                ">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h3 style="margin: 0; color: var(--SmartThemeEmColor);">EchoGraph 设置</h3>
-                        <button id="cf-close-settings" class="menu_button" style="padding: 5px 10px;">✕</button>
+            <div id="echograph-settings-modal" class="eg-style-1">
+                <div class="eg-style-2">
+                    <div class="eg-style-3">
+                        <h3 class="eg-style-4">EchoGraph 设置</h3>
+                        <button id="cf-close-settings" class="menu_button eg-style-5">关闭</button>
                     </div>
                     <div>
                         <form id="echograph-settings-form">
-                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                            <div class="eg-style-6">
                                 <div>
-                                    <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">基础设置</h5>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-enabled" style="margin-right: 8px;">
+                                    <h5 class="eg-style-7">基础设置</h5>
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-enabled" class="eg-style-9">
                                             启用 EchoGraph 增强
                                         </label>
                                     </div>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: block; margin-bottom: 5px;">EchoGraph API 地址：</label>
-                                        <div style="display: flex; gap: 10px;">
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-10">EchoGraph API 地址：</label>
+                                        <div class="eg-style-11">
                                             <input type="text" id="cf-api-url" placeholder="http://127.0.0.1:9543"
-                                                   style="flex: 1; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
+                                                   class="eg-style-12">
                                             <button class="menu_button" type="button" id="cf-test-api-btn">测试连接</button>
                                         </div>
-                                        <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">EchoGraph 后端服务器地址（默认端口9543）</small>
+                                        <small class="eg-style-13">EchoGraph 后端服务器地址（默认端口9543）</small>
                                     </div>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-auto-init" style="margin-right: 8px;">
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-auto-init" class="eg-style-9">
                                             自动初始化会话
                                         </label>
                                     </div>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-notifications" style="margin-right: 8px;">
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-notifications" class="eg-style-9">
                                             显示通知
                                         </label>
                                     </div>
                                 </div>
                                 <div>
-                                    <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">记忆系统设置</h5>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: block; margin-bottom: 5px;">热记忆轮次：</label>
+                                    <h5 class="eg-style-7">记忆系统设置</h5>
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-10">热记忆轮次：</label>
                                         <input type="number" id="cf-hot-memory" min="1" max="20"
-                                               style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
+                                               class="eg-style-14">
                                     </div>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: block; margin-bottom: 5px;">最大语境长度：</label>
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-10">最大语境长度：</label>
                                         <input type="number" id="cf-max-context" min="1000" max="10000"
-                                               style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
+                                               class="eg-style-14">
                                     </div>
-                                    <div style="margin-bottom: 15px;">
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-debug" style="margin-right: 8px;">
+                                    <div class="eg-style-7">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-debug" class="eg-style-9">
                                             调试模式
                                         </label>
                                     </div>
                                 </div>
                             </div>
 
-                            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--SmartThemeBorderColor);">
-                                <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">滑动窗口设置</h5>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                            <div class="eg-style-15">
+                                <h5 class="eg-style-7">滑动窗口设置</h5>
+                                <div class="eg-style-6">
                                     <div>
-                                        <label style="display: block; margin-bottom: 5px;">窗口大小：</label>
+                                        <label class="eg-style-10">窗口大小：</label>
                                         <input type="number" id="cf-window-size" min="3" max="10" value="4"
-                                               style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                        <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">保留最近的对话轮数</small>
+                                               class="eg-style-14">
+                                        <small class="eg-style-13">保留最近的对话轮数</small>
                                     </div>
                                     <div>
-                                        <label style="display: block; margin-bottom: 5px;">处理延迟：</label>
+                                        <label class="eg-style-10">处理延迟：</label>
                                         <input type="number" id="cf-processing-delay" min="1" max="5" value="1"
-                                               style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                        <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">延迟处理的轮次数</small>
+                                               class="eg-style-14">
+                                        <small class="eg-style-13">延迟处理的轮次数</small>
                                     </div>
                                 </div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
+                                <div class="eg-style-16">
                                     <div>
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-enhanced-agent" checked style="margin-right: 8px;">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-enhanced-agent" checked class="eg-style-9">
                                             启用增强智能体
                                         </label>
-                                        <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">基于世界观创建丰富的角色节点</small>
+                                        <small class="eg-style-13">基于世界观创建丰富的角色节点</small>
                                     </div>
                                     <div>
-                                        <label style="display: flex; align-items: center;">
-                                            <input type="checkbox" id="cf-conflict-resolution" checked style="margin-right: 8px;">
+                                        <label class="eg-style-8">
+                                            <input type="checkbox" id="cf-conflict-resolution" checked class="eg-style-9">
                                             启用冲突解决
                                         </label>
-                                        <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">处理酒馆对话历史修改</small>
+                                        <small class="eg-style-13">处理酒馆对话历史修改</small>
                                     </div>
                                 </div>
                             </div>
                         </form>
                     </div>
-                    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--SmartThemeBorderColor); display: flex; justify-content: flex-end; gap: 10px;">
+                    <div class="eg-style-17">
                         <button id="cf-cancel-settings" class="menu_button">取消</button>
                         <button id="cf-save-settings" class="menu_button menu_button_icon">保存设置</button>
                     </div>
@@ -1486,8 +1528,8 @@ jQuery(async () => {
         `;
 
         // 如果在主页面中，添加到主页面容器；否则添加到body
-        const targetContainer = $('#echograph-main-page').length ? $('#echograph-main-page') : $('body');
-        targetContainer.append(modalHtml);
+        $('body').append(modalHtml);
+        $('#echograph-settings-modal').show();
 
         // 绑定关闭事件
         $('#cf-close-settings, #cf-cancel-settings').on('click', () => {
@@ -1505,23 +1547,16 @@ jQuery(async () => {
         $('#cf-save-settings').on('click', saveSettingsFromModal);
 
         // Bind test API connection
-        $('#cf-test-api-btn').on('click', async () => {
-            const apiUrl = $('#cf-api-url').val() || DEFAULT_API_BASE_URL;
-            // 简单检查WebSocket状态，因为HTTP健康检查已被移除
-            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-                alert(`✅ WebSocket已连接到 ${webSocket.url}`);
-            } else {
-                alert(`❌ WebSocket未连接。请确保EchoGraph后端服务器正在运行，并且已在SillyTavern中选择了角色以尝试连接。`);
-            }
-        });
+        $('#cf-test-api-btn').on('click', () => testAPIConnection($('#cf-api-url').val() || DEFAULT_API_BASE_URL));
+        loadSettingsToModal();
     }
 
     function createDebugPanel() {
         const panelHtml = `
-            <div id="echograph-panel" class="cf-panel" style="display: none;">
+            <div id="echograph-panel" class="cf-panel eg-style-18">
                 <div class="cf-panel-header">
                     <div class="cf-panel-title">
-                        <span class="cf-icon">🔮</span>
+                        <span class="cf-icon">EchoGraph</span>
                         EchoGraph 滑动窗口状态
                     </div>
                     <div class="cf-panel-controls">
@@ -1606,317 +1641,6 @@ jQuery(async () => {
                     </div>
                 </div>
             </div>
-
-            <style>
-            .cf-panel {
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                width: 380px;
-                max-height: 80vh;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                border: 1px solid #4a90e2;
-                border-radius: 12px;
-                box-shadow: 0 8px 32px rgba(0,0,0,0.3);
-                font-family: 'Segoe UI', 'Arial', sans-serif;
-                z-index: 10000;
-                overflow: hidden;
-                transition: all 0.3s ease;
-            }
-
-            .cf-panel-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                background: linear-gradient(90deg, #4a90e2 0%, #357abd 100%);
-                color: white;
-                padding: 12px 16px;
-                font-weight: 600;
-                font-size: 14px;
-            }
-
-            .cf-panel-title {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-
-            .cf-icon {
-                font-size: 16px;
-            }
-
-            .cf-panel-controls {
-                display: flex;
-                gap: 4px;
-            }
-
-            .cf-btn {
-                background: rgba(255,255,255,0.2);
-                border: none;
-                color: white;
-                padding: 4px 8px;
-                border-radius: 4px;
-                cursor: pointer;
-                transition: background 0.2s;
-            }
-
-            .cf-btn:hover {
-                background: rgba(255,255,255,0.3);
-            }
-
-            .cf-btn-sm {
-                padding: 2px 6px;
-                font-size: 12px;
-            }
-
-            .cf-panel-body {
-                padding: 16px;
-                color: #e0e6ed;
-                max-height: 70vh;
-                overflow-y: auto;
-            }
-
-            .cf-panel-body::-webkit-scrollbar {
-                width: 6px;
-            }
-
-            .cf-panel-body::-webkit-scrollbar-track {
-                background: #2a2a3e;
-                border-radius: 3px;
-            }
-
-            .cf-panel-body::-webkit-scrollbar-thumb {
-                background: #4a90e2;
-                border-radius: 3px;
-            }
-
-            .cf-panel-body h3 {
-                color: #4a90e2;
-                font-size: 13px;
-                margin: 0 0 12px 0;
-                padding-bottom: 6px;
-                border-bottom: 1px solid #333;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-            }
-
-            .cf-status-grid, .cf-stats-grid {
-                display: grid;
-                gap: 8px;
-                margin-bottom: 20px;
-            }
-
-            .cf-status-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .cf-stats-grid {
-                grid-template-columns: repeat(3, 1fr);
-            }
-
-            .cf-status-item {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                padding: 8px 12px;
-                background: rgba(255,255,255,0.05);
-                border-radius: 6px;
-                font-size: 12px;
-            }
-
-            .cf-label {
-                font-weight: 500;
-                color: #b0b8c4;
-            }
-
-            .cf-value {
-                color: #4a90e2;
-                font-weight: 500;
-            }
-
-            .cf-status-indicator {
-                padding: 2px 8px;
-                border-radius: 12px;
-                font-size: 11px;
-                font-weight: 600;
-                text-transform: uppercase;
-            }
-
-            .cf-status-connected {
-                background: #27ae60;
-                color: white;
-            }
-
-            .cf-status-disconnected {
-                background: #e74c3c;
-                color: white;
-            }
-
-            .cf-status-unknown {
-                background: #f39c12;
-                color: white;
-            }
-
-            .cf-stat-card {
-                background: rgba(255,255,255,0.08);
-                border-radius: 8px;
-                padding: 12px;
-                text-align: center;
-                border: 1px solid rgba(74,144,226,0.3);
-            }
-
-            .cf-stat-number {
-                font-size: 20px;
-                font-weight: 700;
-                color: #4a90e2;
-                margin-bottom: 4px;
-            }
-
-            .cf-stat-label {
-                font-size: 11px;
-                color: #b0b8c4;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-            }
-
-            .cf-activity-log {
-                background: rgba(0,0,0,0.3);
-                border-radius: 6px;
-                padding: 8px;
-                max-height: 120px;
-                overflow-y: auto;
-                margin-bottom: 20px;
-            }
-
-            .cf-activity-item {
-                padding: 6px 8px;
-                border-left: 3px solid #4a90e2;
-                margin-bottom: 4px;
-                background: rgba(255,255,255,0.02);
-                font-size: 11px;
-                border-radius: 0 4px 4px 0;
-            }
-
-            .cf-activity-success {
-                border-left-color: #27ae60;
-                background: rgba(39,174,96,0.1);
-            }
-
-            .cf-activity-warning {
-                border-left-color: #f39c12;
-                background: rgba(243,156,18,0.1);
-            }
-
-            .cf-activity-error {
-                border-left-color: #e74c3c;
-                background: rgba(231,76,60,0.1);
-            }
-
-            .cf-timestamp {
-                color: #7f8c8d;
-                font-size: 10px;
-            }
-
-            .cf-button-group {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 8px;
-            }
-
-            .cf-btn-primary {
-                background: #4a90e2;
-                border: none;
-                color: white;
-                padding: 8px 12px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 12px;
-                font-weight: 500;
-                transition: all 0.2s;
-                grid-column: 1 / -1;
-            }
-
-            .cf-btn-primary:hover {
-                background: #357abd;
-                transform: translateY(-1px);
-            }
-
-            .cf-btn-info {
-                background: #17a2b8;
-                border: none;
-                color: white;
-                padding: 8px 12px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 12px;
-                font-weight: 500;
-                transition: all 0.2s;
-            }
-
-            .cf-btn-info:hover {
-                background: #138496;
-                transform: translateY(-1px);
-            }
-
-            .cf-btn-warning {
-                background: #f39c12;
-                border: none;
-                color: white;
-                padding: 8px 12px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 12px;
-                font-weight: 500;
-                transition: all 0.2s;
-            }
-
-            .cf-btn-warning:hover {
-                background: #d68910;
-                transform: translateY(-1px);
-            }
-
-            .cf-btn-secondary {
-                background: #6c757d;
-                border: none;
-                color: white;
-                padding: 8px 12px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 12px;
-                font-weight: 500;
-                transition: all 0.2s;
-            }
-
-            .cf-btn-secondary:hover {
-                background: #545b62;
-                transform: translateY(-1px);
-            }
-
-            .cf-btn-danger {
-                background: #dc3545;
-                border: none;
-                color: white;
-                padding: 8px 12px;
-                border-radius: 6px;
-                cursor: pointer;
-                font-size: 12px;
-                font-weight: 500;
-                transition: all 0.2s;
-            }
-
-            .cf-btn-danger:hover {
-                background: #c82333;
-                transform: translateY(-1px);
-            }
-
-            .cf-panel.minimized .cf-panel-body {
-                display: none;
-            }
-
-            .cf-panel.minimized {
-                width: 250px;
-            }
-            </style>
         `;
 
         $('body').append(panelHtml);
@@ -1968,6 +1692,8 @@ jQuery(async () => {
     }
 
     function saveSettingsFromModal() {
+        const wasEnabled = pluginSettings.enabled;
+        const oldApiUrl = pluginSettings.api_base_url;
         pluginSettings.enabled = $('#cf-enabled').prop('checked');
         pluginSettings.api_base_url = $('#cf-api-url').val();
         pluginSettings.auto_initialize = $('#cf-auto-init').prop('checked');
@@ -1984,6 +1710,20 @@ jQuery(async () => {
         pluginSettings.sliding_window.enable_conflict_resolution = $('#cf-conflict-resolution').prop('checked');
 
         saveSettings();
+        if (!pluginSettings.enabled) {
+            stopHeartbeat();
+            disconnectWebSocket();
+            updatePanelStatus('已禁用', 'disconnected');
+        } else {
+            startHeartbeat();
+            if (!wasEnabled || oldApiUrl !== pluginSettings.api_base_url) {
+                disconnectWebSocket();
+                lastHealthOk = false;
+                if (currentSessionId) testAPIConnection().then(() => {
+                    if (lastHealthOk) connectWebSocket(currentSessionId);
+                });
+            }
+        }
         $('#echograph-settings-modal').hide();
         showNotification('设置已成功保存', 'success');
 
@@ -2002,8 +1742,8 @@ jQuery(async () => {
         const character = context.characters?.[context.characterId];
 
         // Update new panel
-        updatePanelStatus(pluginSettings.enabled ? '激活' : '已禁用',
-                         pluginSettings.enabled ? 'connected' : 'disconnected');
+        updatePanelStatus(isWsOpen() ? '已连接' : (pluginSettings.enabled ? '未连接' : '已禁用'),
+                         isWsOpen() ? 'connected' : 'disconnected');
 
         // Update session and character status in both panels
         const sessionText = currentSessionId ? currentSessionId.substring(0, 8) + '...' : '未初始化';
@@ -2040,152 +1780,91 @@ jQuery(async () => {
         }
 
         const mainPageHtml = `
-            <div id="echograph-main-page" style="
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100vw;
-                height: 100vh;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                z-index: 10001;
-                color: #e0e6ed;
-                overflow-y: auto;
-                font-family: 'Segoe UI', Arial, sans-serif;
-            ">
-                <div class="cf-main-header" style="
-                    background: linear-gradient(90deg, #4a90e2 0%, #357abd 100%);
-                    padding: 20px;
-                    text-align: center;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
-                ">
-                    <h1 style="margin: 0; color: white; font-size: 28px;">
+            <div id="echograph-main-page" class="eg-style-19">
+                <div class="cf-main-header eg-style-20">
+                    <h1 class="eg-style-21">
                         EchoGraph 滑动窗口智能增强
                     </h1>
-                    <p style="margin: 10px 0 0 0; color: rgba(255,255,255,0.9); font-size: 16px;">
+                    <p class="eg-style-22">
                         版本 ${PLUGIN_VERSION} - 智能对话记忆管理系统
                     </p>
-                    <button id="cf-close-main-page" style="
-                        position: absolute;
-                        top: 15px;
-                        right: 20px;
-                        background: rgba(255,255,255,0.2);
-                        border: none;
-                        color: white;
-                        padding: 8px 12px;
-                        border-radius: 6px;
-                        cursor: pointer;
-                        font-size: 16px;
-                    ">× 关闭</button>
+                    <button id="cf-close-main-page" class="eg-style-23">× 关闭</button>
                 </div>
 
-                <div class="cf-main-content" style="
-                    padding: 30px;
-                    max-width: 1200px;
-                    margin: 0 auto;
-                ">
-                    <div class="cf-dashboard-grid" style="
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-                        gap: 25px;
-                        margin-bottom: 30px;
-                    ">
+                <div class="cf-main-content eg-style-24">
+                    <div class="cf-dashboard-grid eg-style-25">
                         <!-- 连接状态卡片 -->
-                        <div class="cf-card" style="
-                            background: rgba(255,255,255,0.08);
-                            border-radius: 12px;
-                            padding: 25px;
-                            border: 1px solid rgba(74,144,226,0.3);
-                        ">
-                            <h3 style="color: #4a90e2; margin-bottom: 20px;">连接状态</h3>
+                        <div class="cf-card eg-style-26">
+                            <h3 class="eg-style-7">连接状态</h3>
                             <div class="cf-connection-status">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <div class="eg-style-27">
                                     <span>API 连接:</span>
                                     <span id="cf-main-api-status" class="cf-status-indicator cf-status-disconnected">未连接</span>
                                 </div>
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                <div class="eg-style-27">
                                     <span>会话状态:</span>
                                     <span id="cf-main-session-status">未初始化</span>
                                 </div>
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                                <div class="eg-style-3">
                                     <span>当前角色:</span>
                                     <span id="cf-main-character-status">无</span>
                                 </div>
-                                <button id="cf-main-test-connection" class="cf-btn cf-btn-primary" style="width: 100%; margin-bottom: 10px;">测试连接</button>
-                                <button id="cf-main-settings" class="cf-btn cf-btn-secondary" style="width: 100%;">打开设置</button>
+                                <button id="cf-main-test-connection" class="cf-btn cf-btn-primary eg-style-28">测试连接</button>
+                                <button id="cf-main-settings" class="cf-btn cf-btn-secondary eg-style-29">打开设置</button>
                             </div>
                         </div>
 
                         <!-- 滑动窗口状态卡片 -->
-                        <div class="cf-card" style="
-                            background: rgba(255,255,255,0.08);
-                            border-radius: 12px;
-                            padding: 25px;
-                            border: 1px solid rgba(74,144,226,0.3);
-                        ">
-                            <h3 style="color: #4a90e2; margin-bottom: 20px;">滑动窗口状态</h3>
-                            <div class="cf-stats-grid" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-window-turns" style="font-size: 24px; font-weight: bold; color: #4a90e2;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">窗口轮次</div>
+                        <div class="cf-card eg-style-26">
+                            <h3 class="eg-style-7">滑动窗口状态</h3>
+                            <div class="cf-stats-grid eg-style-30">
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-window-turns" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">窗口轮次</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-processed-turns" style="font-size: 24px; font-weight: bold; color: #27ae60;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">已处理轮次</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-processed-turns" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">已处理轮次</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-conflicts-resolved" style="font-size: 24px; font-weight: bold; color: #f39c12;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">解决冲突</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-conflicts-resolved" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">解决冲突</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-window-capacity" style="font-size: 24px; font-weight: bold; color: #9b59b6;">4</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">窗口容量</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-window-capacity" class="eg-style-32">4</div>
+                                    <div class="eg-style-13">窗口容量</div>
                                 </div>
                             </div>
                         </div>
 
                         <!-- 知识图谱统计卡片 -->
-                        <div class="cf-card" style="
-                            background: rgba(255,255,255,0.08);
-                            border-radius: 12px;
-                            padding: 25px;
-                            border: 1px solid rgba(74,144,226,0.3);
-                        ">
-                            <h3 style="color: #4a90e2; margin-bottom: 20px;">知识图谱</h3>
-                            <div class="cf-stats-grid" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px;">
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-graph-nodes" style="font-size: 24px; font-weight: bold; color: #4a90e2;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">图谱节点</div>
+                        <div class="cf-card eg-style-26">
+                            <h3 class="eg-style-7">知识图谱</h3>
+                            <div class="cf-stats-grid eg-style-30">
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-graph-nodes" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">图谱节点</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-graph-edges" style="font-size: 24px; font-weight: bold; color: #27ae60;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">关系边</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-graph-edges" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">关系边</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-memory-turns" style="font-size: 24px; font-weight: bold; color: #f39c12;">0</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">记忆轮次</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-memory-turns" class="eg-style-32">0</div>
+                                    <div class="eg-style-13">记忆轮次</div>
                                 </div>
-                                <div class="cf-stat-item" style="text-align: center;">
-                                    <div id="cf-main-last-update" style="font-size: 14px; color: #b0b8c4;">--:--:--</div>
-                                    <div style="font-size: 12px; color: #b0b8c4;">最后更新</div>
+                                <div class="cf-stat-item eg-style-31">
+                                    <div id="cf-main-last-update" class="eg-style-33">--:--:--</div>
+                                    <div class="eg-style-13">最后更新</div>
                                 </div>
                             </div>
                         </div>
                     </div>
 
                     <!-- 快捷操作区域 -->
-                    <div class="cf-card" style="
-                        background: rgba(255,255,255,0.08);
-                        border-radius: 12px;
-                        padding: 25px;
-                        border: 1px solid rgba(74,144,226,0.3);
-                        margin-bottom: 30px;
-                    ">
-                        <h3 style="color: #4a90e2; margin-bottom: 20px;">快捷操作</h3>
-                        <div class="cf-main-buttons" style="
-                            display: grid;
-                            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                            gap: 15px;
-                        ">
+                    <div class="cf-card eg-style-34">
+                        <h3 class="eg-style-7">快捷操作</h3>
+                        <div class="cf-main-buttons eg-style-35">
                             <button id="cf-main-refresh-stats" class="cf-btn cf-btn-primary">刷新统计</button>
                             <button id="cf-main-sync-conversation" class="cf-btn cf-btn-info">同步对话</button>
                             <button id="cf-main-clear-memory" class="cf-btn cf-btn-warning">清除记忆</button>
@@ -2197,22 +1876,10 @@ jQuery(async () => {
                     </div>
 
                     <!-- 活动日志区域 -->
-                    <div class="cf-card" style="
-                        background: rgba(255,255,255,0.08);
-                        border-radius: 12px;
-                        padding: 25px;
-                        border: 1px solid rgba(74,144,226,0.3);
-                    ">
-                        <h3 style="color: #4a90e2; margin-bottom: 20px;">最近活动</h3>
-                        <div id="cf-main-activity-log" style="
-                            background: rgba(0,0,0,0.3);
-                            border-radius: 6px;
-                            padding: 15px;
-                            max-height: 300px;
-                            overflow-y: auto;
-                            font-size: 13px;
-                        ">
-                            <div style="color: #7f8c8d;">等待活动中...</div>
+                    <div class="cf-card eg-style-26">
+                        <h3 class="eg-style-7">最近活动</h3>
+                        <div id="cf-main-activity-log" class="eg-style-36">
+                            <div class="eg-style-37">等待活动中...</div>
                         </div>
                     </div>
                 </div>
@@ -2249,177 +1916,7 @@ jQuery(async () => {
             // 然后调用测试连接
             await testAPIConnection();
         });
-        $('#cf-main-settings, #cf-main-open-settings').on('click', () => {
-            // 移除旧的设置模态框
-            $('#echograph-settings-modal').remove();
-
-            // 在主页面中创建设置模态框
-            const modalHtml = `
-                <div id="echograph-settings-modal" style="
-                    position: fixed;
-                    top: 0;
-                    left: 0;
-                    width: 100vw;
-                    height: 100vh;
-                    background: rgba(0,0,0,0.8);
-                    display: flex;
-                    z-index: 10002;
-                    justify-content: center;
-                    align-items: center;
-                ">
-                    <div style="
-                        background: var(--SmartThemeBodyColor, #1a1a2e);
-                        border: 1px solid var(--SmartThemeBorderColor, #4a90e2);
-                        border-radius: 10px;
-                        width: 90%;
-                        max-width: 700px;
-                        max-height: 85vh;
-                        overflow-y: auto;
-                        padding: 20px;
-                        box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-                        position: relative;
-                        color: var(--SmartThemeEmColor, #e0e6ed);
-                    ">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                            <h3 style="margin: 0; color: var(--SmartThemeEmColor);">EchoGraph 设置</h3>
-                            <button id="cf-close-settings" class="menu_button" style="padding: 5px 10px;">✕</button>
-                        </div>
-                        <div>
-                            <form id="echograph-settings-form">
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                                    <div>
-                                        <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">基础设置</h5>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-enabled" style="margin-right: 8px;">
-                                                启用 EchoGraph 增强
-                                            </label>
-                                        </div>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: block; margin-bottom: 5px;">EchoGraph API 地址：</label>
-                                            <div style="display: flex; gap: 10px;">
-                                                <input type="text" id="cf-api-url" placeholder="http://127.0.0.1:9543"
-                                                       style="flex: 1; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                                <button class="menu_button" type="button" id="cf-test-api-btn">测试连接</button>
-                                            </div>
-                                            <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">EchoGraph 后端服务器地址（默认端口9543）</small>
-                                        </div>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-auto-init" style="margin-right: 8px;">
-                                                自动初始化会话
-                                            </label>
-                                        </div>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-notifications" style="margin-right: 8px;">
-                                                显示通知
-                                            </label>
-                                        </div>
-                                    </div>
-                                    <div>
-                                        <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">记忆系统设置</h5>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: block; margin-bottom: 5px;">热记忆轮次：</label>
-                                            <input type="number" id="cf-hot-memory" min="1" max="20"
-                                                   style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                        </div>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: block; margin-bottom: 5px;">最大语境长度：</label>
-                                            <input type="number" id="cf-max-context" min="1000" max="10000"
-                                                   style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                        </div>
-                                        <div style="margin-bottom: 15px;">
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-debug" style="margin-right: 8px;">
-                                                调试模式
-                                            </label>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--SmartThemeBorderColor);">
-                                    <h5 style="color: var(--SmartThemeEmColor); margin-bottom: 15px;">滑动窗口设置</h5>
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-                                        <div>
-                                            <label style="display: block; margin-bottom: 5px;">窗口大小：</label>
-                                            <input type="number" id="cf-window-size" min="3" max="10" value="4"
-                                                   style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                            <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">保留最近的对话轮数</small>
-                                        </div>
-                                        <div>
-                                            <label style="display: block; margin-bottom: 5px;">处理延迟：</label>
-                                            <input type="number" id="cf-processing-delay" min="1" max="5" value="1"
-                                                   style="width: 100%; padding: 8px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 4px; background: var(--SmartThemeBodyColor); color: var(--SmartThemeEmColor);">
-                                            <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">延迟处理的轮次数</small>
-                                        </div>
-                                    </div>
-                                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
-                                        <div>
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-enhanced-agent" checked style="margin-right: 8px;">
-                                                启用增强智能体
-                                            </label>
-                                            <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">基于世界观创建丰富的角色节点</small>
-                                        </div>
-                                        <div>
-                                            <label style="display: flex; align-items: center;">
-                                                <input type="checkbox" id="cf-conflict-resolution" checked style="margin-right: 8px;">
-                                                启用冲突解决
-                                            </label>
-                                            <small style="color: var(--SmartThemeQuoteColor); font-size: 12px;">处理酒馆对话历史修改</small>
-                                        </div>
-                                    </div>
-                                </div>
-                            </form>
-                        </div>
-                        <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid var(--SmartThemeBorderColor); display: flex; justify-content: flex-end; gap: 10px;">
-                            <button id="cf-cancel-settings" class="menu_button">取消</button>
-                            <button id="cf-save-settings" class="menu_button menu_button_icon">保存设置</button>
-                        </div>
-                    </div>
-                </div>
-            `;
-
-            $('body').append(modalHtml);
-
-            // 绑定事件
-            $('#cf-close-settings, #cf-cancel-settings').on('click', () => {
-                $('#echograph-settings-modal').remove();
-            });
-
-            // 点击背景关闭
-            $('#echograph-settings-modal').on('click', (e) => {
-                if (e.target.id === 'echograph-settings-modal') {
-                    $('#echograph-settings-modal').remove();
-                }
-            });
-
-            $('#cf-save-settings').on('click', saveSettingsFromModal);
-
-            // 绑定测试API连接事件
-            $('#cf-test-api-btn').on('click', async () => {
-                const apiUrl = $('#cf-api-url').val() || DEFAULT_API_BASE_URL;
-                try {
-                    $('#cf-test-api-btn').prop('disabled', true).text('测试中...');
-
-                    const response = await fetch(`${apiUrl}/health`);
-                    if (response.ok) {
-                        const data = await response.json();
-                        alert(`✅ 连接成功！\n\n服务器信息：\n• 版本: ${data.version}\n• 活跃会话: ${data.active_sessions}\n• 已注册角色: ${data.total_characters}`);
-                    } else {
-                        alert(`❌ 连接失败\n\nHTTP状态: ${response.status}\n请检查服务器地址和端口是否正确`);
-                    }
-                } catch (error) {
-                    alert(`❌ 无法连接到API服务器\n\n错误信息: ${error.message}\n\n请确认：\n1. EchoGraph服务器正在运行\n2. API地址格式正确\n3. 防火墙未阻止连接`);
-                } finally {
-                    $('#cf-test-api-btn').prop('disabled', false).text('测试连接');
-                }
-            });
-
-            // 加载设置到模态框
-            loadSettingsToModal();
-        });
+        $('#cf-main-settings, #cf-main-open-settings').on('click', createSettingsModal);
         $('#cf-main-refresh-stats').on('click', refreshMainPageStats);
         $('#cf-main-sync-conversation').on('click', () => {
             syncConversationState();
@@ -2454,18 +1951,29 @@ jQuery(async () => {
             });
             const statusElement = $('#cf-main-api-status');
             if (response.ok) {
-                // 更新主页面与面板状态
+                const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
+                const mode = await modeResponse.json();
+                lastHealthOk = !!mode.active;
+                if (!mode.active) {
+                    statusElement.removeClass('cf-status-connected cf-status-unknown')
+                                 .addClass('cf-status-disconnected').text('酒馆模式未启用');
+                    updatePanelStatus('酒馆模式未启用', 'disconnected');
+                    return;
+                }
                 statusElement.removeClass('cf-status-disconnected cf-status-unknown')
-                             .addClass('cf-status-connected')
-                             .text('已连接');
-                updatePanelStatus('连接正常', 'connected');
+                             .addClass(isWsOpen() ? 'cf-status-connected' : 'cf-status-unknown')
+                             .text(isWsOpen() ? '已连接' : 'API 可用');
+                updatePanelStatus(isWsOpen() ? '已连接' : 'API 可用', isWsOpen() ? 'connected' : 'unknown');
             } else {
+                lastHealthOk = false;
                 statusElement.removeClass('cf-status-connected cf-status-unknown')
                              .addClass('cf-status-disconnected')
                              .text('连接失败');
                 updatePanelStatus('连接异常', 'disconnected');
             }
         } catch (error) {
+            lastHealthOk = false;
             const statusElement = $('#cf-main-api-status');
             statusElement.removeClass('cf-status-connected cf-status-unknown')
                          .addClass('cf-status-disconnected')
@@ -2535,19 +2043,10 @@ jQuery(async () => {
 
         const timestamp = new Date().toLocaleTimeString();
 
-        const typeColors = {
-            success: '#27ae60',
-            warning: '#f39c12',
-            error: '#e74c3c',
-            info: '#4a90e2'
-        };
-
-        const color = typeColors[type] || typeColors.info;
-
         const logHtml = `
-            <div style="margin-bottom: 8px; padding: 6px; border-left: 3px solid ${color}; background: rgba(255,255,255,0.02);">
-                <div style="color: ${color}; font-weight: 500;">${message}</div>
-                <div style="color: #7f8c8d; font-size: 11px; margin-top: 2px;">${timestamp}</div>
+            <div class="eg-log-item eg-log-${type}">
+                <div class="eg-log-message">${escapeHtml(message)}</div>
+                <div class="eg-log-time">${timestamp}</div>
             </div>
         `;
 
@@ -2561,53 +2060,14 @@ jQuery(async () => {
     }
 
     function addMenuItems() {
-        // Add standalone plugin page to extensions menu - try multiple selectors for compatibility
         logDebug('尝试添加菜单项到扩展菜单...');
-
-        // 尝试多种可能的扩展菜单选择器
-        const possibleSelectors = [
-            '#rm_extensions_block .extensions_block',  // 原选择器
-            '#extensions_block',                       // 简化选择器
-            '.extensions_block',                       // 通用类选择器
-            '#rm_extensions_block',                    // 父容器
-            '[data-extension-menu]',                   // 数据属性选择器
-            '.extension-settings'                      // 设置相关选择器
-        ];
-
-        let extensionsBlock = null;
-        for (const selector of possibleSelectors) {
-            extensionsBlock = $(selector);
-            if (extensionsBlock.length > 0) {
-                logDebug(`找到扩展菜单容器: ${selector}`);
-                break;
-            }
-        }
-
-        // 如果还是找不到，尝试查找任何包含"extension"的元素
-        if (!extensionsBlock || extensionsBlock.length === 0) {
-            logDebug('尝试查找包含extension的元素...');
-            $('[class*="extension"], [id*="extension"]').each(function() {
-                logDebug(`发现可能的扩展元素: ${this.className} (ID: ${this.id})`);
-            });
-
-            // 作为最后的备选方案，添加到主菜单或导航栏
-            extensionsBlock = $('#nav_menu, .navbar, .main-menu, body');
-            logDebug('使用备选容器添加菜单项');
-        }
+        const extensionsBlock = $('#extensionsMenu');
 
         if (extensionsBlock && extensionsBlock.length && !$('#echograph-menu-item').length) {
             const menuItem = $(`
-                <div id="echograph-menu-item" class="list-group-item flex-container flexGap5 interactable" style="
-                    cursor: pointer;
-                    padding: 8px 12px;
-                    margin: 2px 0;
-                    border: 1px solid #dee2e6;
-                    border-radius: 4px;
-                    background: #f8f9fa;
-                    transition: background-color 0.2s;
-                ">
-                    <div class="fa-solid fa-brain extensionsMenuExtensionButton" style="color: #4a90e2;"></div>
-                    <span style="margin-left: 8px; font-weight: 500;">EchoGraph 滑动窗口</span>
+                <div id="echograph-menu-item" class="list-group-item flex-container flexGap5 interactable eg-style-38">
+                    <div class="fa-solid fa-brain extensionsMenuExtensionButton eg-style-37"></div>
+                    <span class="eg-style-39">EchoGraph 滑动窗口</span>
                 </div>
             `);
 
@@ -2616,67 +2076,107 @@ jQuery(async () => {
                 showEchoGraphMainPage();
             });
 
-            menuItem.on('mouseenter', function() {
-                $(this).css('background-color', '#e9ecef');
-            }).on('mouseleave', function() {
-                $(this).css('background-color', '#f8f9fa');
-            });
 
             extensionsBlock.append(menuItem);
             logDebug('EchoGraph菜单项已添加到扩展菜单');
 
-            // 同时添加一个浮动按钮作为备用入口
-            addFloatingButton();
         } else {
-            logDebug('无法找到合适的扩展菜单容器，仅添加浮动按钮');
-            addFloatingButton();
-        }
-    }
-
-    function addFloatingButton() {
-        // 添加浮动按钮作为备用UI入口
-        if (!$('#echograph-floating-btn').length) {
-            const floatingBtn = $(`
-                <div id="echograph-floating-btn" style="
-                    position: fixed;
-                    top: 20px;
-                    right: 80px;
-                    width: 45px;
-                    height: 45px;
-                    background: linear-gradient(135deg, #4a90e2 0%, #357abd 100%);
-                    border-radius: 50%;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    cursor: pointer;
-                    box-shadow: 0 4px 20px rgba(74,144,226,0.3);
-                    z-index: 9998;
-                    transition: all 0.3s ease;
-                    color: white;
-                    font-size: 16px;
-                    font-weight: bold;
-                " title="打开 EchoGraph 界面">
-                    CF
-                </div>
-            `);
-
-            floatingBtn.on('click', () => {
-                logDebug('EchoGraph浮动按钮被点击');
-                showEchoGraphMainPage();
-            });
-
-            floatingBtn.on('mouseenter', function() {
-                $(this).css('transform', 'scale(1.1)');
-            }).on('mouseleave', function() {
-                $(this).css('transform', 'scale(1)');
-            });
-
-            $('body').append(floatingBtn);
-            logDebug('EchoGraph浮动按钮已添加');
+            logDebug('扩展菜单尚未就绪');
         }
     }
 
     // 加载插件设置
+    if (!document.getElementById('echograph-plugin-styles')) {
+        $('head').append(`<style id="echograph-plugin-styles">.eg-style-1 { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 100; justify-content: center; align-items: center; }
+.eg-style-2 { border-radius: 8px; width: 90%; max-width: 700px; max-height: 80%; overflow-y: auto; padding: 16px; position: relative; }
+.eg-style-3 { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.eg-style-4 { margin: 0; }
+.eg-style-5 { padding: 8px 8px; }
+.eg-style-6 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.eg-style-7 { margin-bottom: 16px; }
+.eg-style-8 { display: flex; align-items: center; }
+.eg-style-9 { margin-right: 8px; }
+.eg-style-10 { display: block; margin-bottom: 8px; }
+.eg-style-11 { display: flex; gap: 8px; }
+.eg-style-12 { flex: 1; padding: 8px; border-radius: 4px; }
+.eg-style-13 { font-size: 12px; }
+.eg-style-14 { width: 100%; padding: 8px; border-radius: 4px; }
+.eg-style-15 { margin-top: 16px; padding-top: 16px; }
+.eg-style-16 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+.eg-style-17 { margin-top: 16px; padding-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
+.eg-style-18 { display: none; }
+.eg-style-19 { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10001; overflow-y: auto; }
+.eg-style-20 { padding: 16px; text-align: center; }
+.eg-style-21 { margin: 0; font-size: 28px; }
+.eg-style-22 { margin: 8px 0 0 0; font-size: 16px; }
+.eg-style-23 { position: absolute; top: 16px; right: 16px; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 16px; }
+.eg-style-24 { padding: 30px; max-width: 1200px; margin: 0 auto; }
+.eg-style-25 { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 24px; margin-bottom: 30px; }
+.eg-style-26 { border-radius: 12px; padding: 24px; }
+.eg-style-27 { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.eg-style-28 { width: 100%; margin-bottom: 8px; }
+.eg-style-29 { width: 100%; }
+.eg-style-30 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+.eg-style-31 { text-align: center; }
+.eg-style-32 { font-size: 24px; font-weight: bold; }
+.eg-style-33 { font-size: 14px; }
+.eg-style-34 { border-radius: 12px; padding: 24px; margin-bottom: 30px; }
+.eg-style-35 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; }
+.eg-style-36 { border-radius: 6px; padding: 16px; max-height: 300px; overflow-y: auto; font-size: 13px; }
+.eg-style-38 { cursor: pointer; padding: 8px 12px; margin: 2px 0; border-radius: 4px; }
+.eg-style-39 { margin-left: 8px; font-weight: 500; }
+.eg-style-40 { position: fixed; top: 16px; right: 80px; width: 45px; height: 45px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 9998; font-size: 16px; font-weight: bold; }
+
+#echograph-panel, #echograph-main-page, #echograph-settings-modal, #echograph-floating-btn, #echograph-menu-item {
+    --eg-fg: var(--SmartThemeBodyColor, #e0e0e0);
+    --eg-bg: var(--SmartThemeBlurTintColor, #242424);
+    --eg-accent: var(--SmartThemeQuoteColor, #9aaecb);
+    --eg-border: var(--SmartThemeBorderColor, #666);
+    color: var(--eg-fg);
+    font: inherit;
+    box-sizing: border-box;
+}
+#echograph-panel *, #echograph-main-page *, #echograph-settings-modal * { box-sizing: border-box; }
+#echograph-panel { position: fixed; top: 8px; right: 8px; width: min(380px, calc(100vw - 16px)); max-height: calc(100dvh - 16px); z-index: 10000; overflow: hidden; background: var(--eg-bg); border: 1px solid var(--eg-border); border-radius: 8px; box-shadow: 0 4px 16px var(--SmartThemeShadowColor, #0005); }
+#echograph-panel.minimized { width: min(250px, calc(100vw - 16px)); }
+#echograph-panel.minimized .cf-panel-body { display: none; }
+.cf-panel-header, .cf-main-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 16px; border-bottom: 1px solid var(--eg-border); background: var(--eg-bg); color: var(--eg-fg); }
+.cf-panel-title, .cf-panel-controls, .cf-button-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cf-panel-body { max-height: calc(100dvh - 88px); overflow-y: auto; padding: 16px; }
+.cf-panel-body h3, .cf-card h3, #echograph-settings-modal h3, #echograph-settings-modal h5 { color: var(--SmartThemeEmColor, var(--eg-fg)); margin: 0 0 16px; }
+.cf-status-section, .cf-controls-section, .cf-memory-section, .cf-card { padding: 16px; margin-bottom: 16px; border: 1px solid var(--eg-border); border-radius: 8px; background: var(--eg-bg); min-width: 0; }
+.cf-status-grid, .cf-stats-grid, .cf-dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: 16px; }
+.cf-status-item, .cf-stat-card, .cf-stat-item { min-width: 0; overflow-wrap: anywhere; }
+.cf-btn, #echograph-main-page button, #echograph-settings-modal button { font: inherit; color: var(--eg-fg); background: transparent; border: 1px solid var(--eg-border); border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+.cf-btn:hover, #echograph-main-page button:hover, #echograph-settings-modal button:hover, #echograph-menu-item:hover, #echograph-floating-btn:hover { border-color: var(--eg-accent); color: var(--eg-accent); }
+.cf-btn-primary, .cf-btn-info { border-color: var(--eg-accent); }
+.cf-stat-number, #echograph-main-page [id^="cf-main-"][id$="turns"], #cf-main-graph-nodes, #cf-main-graph-edges { color: var(--eg-accent); font-weight: 600; }
+.cf-status-connected::before, .cf-status-disconnected::before, .cf-status-unknown::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--eg-accent); }
+.cf-status-disconnected::before { background: var(--eg-border); }
+.cf-status-unknown::before { background: var(--SmartThemeEmColor, var(--eg-border)); }
+#echograph-main-page { position: fixed; inset: 0; width: 100%; height: 100dvh; z-index: 10001; overflow-y: auto; background: var(--eg-bg); color: var(--eg-fg); }
+#echograph-main-page .cf-main-content { width: min(1080px, calc(100vw - 16px)); margin: 0 auto; padding: 16px; overflow-x: hidden; }
+#echograph-main-page .cf-main-header { position: sticky; top: 0; z-index: 1; }
+#echograph-settings-modal { position: fixed; inset: 0; z-index: 10002; display: flex; align-items: center; justify-content: center; padding: 8px; background: color-mix(in srgb, var(--eg-bg) 75%, transparent); }
+#echograph-settings-modal > div { width: min(700px, calc(100vw - 16px)); max-height: calc(100dvh - 16px); overflow-y: auto; padding: 16px; background: var(--eg-bg); color: var(--eg-fg); border: 1px solid var(--eg-border); border-radius: 8px; box-shadow: 0 4px 16px var(--SmartThemeShadowColor, #0005); }
+#echograph-settings-modal form > div, #echograph-settings-modal .eg-style-1 { min-width: 0; }
+#echograph-settings-modal input:not([type="checkbox"]) { width: 100%; min-width: 0; padding: 8px; color: var(--eg-fg); background: var(--eg-bg); border: 1px solid var(--eg-border); border-radius: 6px; }
+#echograph-settings-modal label { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+#echograph-settings-modal small, .cf-timestamp, .eg-log-time { color: var(--eg-accent); font-size: 12px; }
+#echograph-menu-item { padding: 8px 12px; margin: 2px 0; border-radius: 6px; cursor: pointer; }
+#echograph-floating-btn { position: fixed; top: 16px; right: 16px; z-index: 9998; width: 44px; height: 44px; display: flex; align-items: center; justify-content: center; background: var(--eg-bg); border: 1px solid var(--eg-border); border-radius: 8px; cursor: pointer; box-shadow: 0 2px 8px var(--SmartThemeShadowColor, #0005); }
+.cf-activity-item, .eg-log-item { padding: 8px; margin-bottom: 8px; border-left: 2px solid var(--eg-accent); overflow-wrap: anywhere; }
+.eg-log-time { margin-top: 4px; }
+#cf-activity-log, #cf-main-activity-log { max-height: 300px; overflow-y: auto; }
+@media (max-width: 640px) {
+  #echograph-main-page .cf-main-content { padding: 8px; }
+  #echograph-main-page .cf-dashboard-grid, #echograph-main-page .cf-stats-grid, #echograph-settings-modal form > div { grid-template-columns: minmax(0, 1fr); }
+  #echograph-settings-modal > div { padding: 8px; }
+  #echograph-panel { top: 8px; right: 8px; }
+}
+</style>`);
+    }
+
     loadSettings();
 
     // Create UI elements
@@ -2692,15 +2192,14 @@ jQuery(async () => {
 
         addMenuItems();
 
-        // 检查是否成功添加了菜单项或浮动按钮
+        // SillyTavern creates the extension menu asynchronously.
         const hasMenuItem = $('#echograph-menu-item').length > 0;
-        const hasFloatingBtn = $('#echograph-floating-btn').length > 0;
 
-        if (!hasMenuItem && !hasFloatingBtn && menuRetryCount < maxMenuRetries) {
+        if (!hasMenuItem && menuRetryCount < maxMenuRetries) {
             logDebug(`菜单项添加失败，${2000 * menuRetryCount}ms后重试...`);
             setTimeout(tryAddMenuItems, 2000 * menuRetryCount); // 递增延迟
         } else {
-            logDebug(`菜单项添加完成 - 菜单项: ${hasMenuItem}, 浮动按钮: ${hasFloatingBtn}`);
+            logDebug(`菜单项添加完成 - 菜单项: ${hasMenuItem}`);
         }
     }
 
@@ -2713,12 +2212,13 @@ jQuery(async () => {
         // Show debug panel if enabled
         if (pluginSettings.debug_mode) {
             $('#echograph-panel').show();
-            updatePanelStatus('System initialized', 'connected');
+            updatePanelStatus('未连接', 'disconnected');
             refreshPanelStats();
         }
 
         // 添加心跳检测机制，保持与API的连接
         let heartbeatInterval = null;
+        let heartbeatBusy = false;
 
         function startHeartbeat() {
             if (heartbeatInterval) {
@@ -2727,23 +2227,38 @@ jQuery(async () => {
 
             // 每30秒检查一次API连接状态
             heartbeatInterval = setInterval(async () => {
-                if (!pluginSettings?.enabled) {
+                if (!pluginSettings?.enabled || heartbeatBusy) {
                     return;
                 }
+                heartbeatBusy = true;
 
                 try {
-                    logDebug('💗 执行心跳检测...');
+                    logDebug('执行心跳检测...');
                     const response = await fetch(`${pluginSettings.api_base_url}/health`, {
                         signal: AbortSignal.timeout(5000)
                     });
 
                     if (response.ok) {
+                        const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                        if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
+                        const mode = await modeResponse.json();
+                        if (!mode.active) {
+                            lastHealthOk = false;
+                            disconnectWebSocket();
+                            updatePanelStatus('酒馆模式未启用', 'disconnected');
+                            return;
+                        }
                         lastHealthOk = true;
                         const data = await response.json();
-                        logDebug(`💗 心跳检测成功 - 活跃会话: ${data.active_sessions}`);
+                        if (isWsOpen()) {
+                            try { await sendWsRequest('ping', {}, 5000); }
+                            catch (error) { try { webSocket?.close(); } catch (e) {} }
+                        }
+                        logDebug(`心跳检测成功 - 活跃会话: ${data.active_sessions}`);
 
                         // 更新连接状态指示器
-                        updatePanelStatus('连接正常', 'connected');
+                        if (!isWsOpen() && currentSessionId) scheduleReconnect();
+                        updatePanelStatus(isWsOpen() ? '已连接' : 'API 可用', isWsOpen() ? 'connected' : 'unknown');
 
                         // 如果主页面打开，更新API状态
                         const statusElement = $('#cf-main-api-status');
@@ -2754,7 +2269,9 @@ jQuery(async () => {
                                 .text('已连接');
                         }
                     } else {
-                        logDebug(`💔 心跳检测失败 - HTTP ${response.status}`);
+                        lastHealthOk = false;
+                        cancelReconnect();
+                        logDebug(`心跳检测失败 - HTTP ${response.status}`);
                         updatePanelStatus('连接异常', 'disconnected');
 
                         // 更新主页面状态
@@ -2767,7 +2284,9 @@ jQuery(async () => {
                         }
                     }
                 } catch (error) {
-                    logDebug(`💔 心跳检测异常: ${error.message}`);
+                    lastHealthOk = false;
+                    cancelReconnect();
+                    logDebug(`心跳检测异常: ${error.message}`);
                     updatePanelStatus('连接断开', 'disconnected');
 
                     // 更新主页面状态
@@ -2778,17 +2297,19 @@ jQuery(async () => {
                             .addClass('cf-status-disconnected')
                             .text('连接断开');
                     }
+                } finally {
+                    heartbeatBusy = false;
                 }
             }, 30000); // 30秒间隔
 
-            logDebug('💗 心跳检测已启动 (30秒间隔)');
+            logDebug('心跳检测已启动 (30秒间隔)');
         }
 
         function stopHeartbeat() {
             if (heartbeatInterval) {
                 clearInterval(heartbeatInterval);
                 heartbeatInterval = null;
-                logDebug('💔 心跳检测已停止');
+                logDebug('心跳检测已停止');
             }
         }
 
@@ -2799,13 +2320,23 @@ jQuery(async () => {
 
         // CHAT_CHANGED处理逻辑 - 简化版本，参考st-memory-enhancement的直接处理方式
         async function onChatChanged() {
-            console.log('[EchoGraph] 🔄 onChatChanged 被调用');
-            logDebug('🔄 onChatChanged 被调用');
+            console.log('[EchoGraph]  onChatChanged 被调用');
+            logDebug('onChatChanged 被调用');
 
             try {
+                if (!pluginSettings?.enabled) return;
                 // 获取当前上下文以检测角色变化
                 const context = getSillyTavernContext();
                 const currentCharacterId = context.characterId;
+                const changedChat = switchChat(context);
+                if (!changedChat) seedRenderedMessages(context);
+                if (changedChat) {
+                    disconnectWebSocket();
+                    currentSessionId = null;
+                    lastCharacterId = null;
+                    initializationPromise = null;
+                    isInitializing = false;
+                }
 
                 console.log('[EchoGraph] onChatChanged - 角色信息:', {
                     characterId: currentCharacterId,
@@ -2837,7 +2368,7 @@ jQuery(async () => {
                     currentSessionId
                 });
 
-                if (hasCharacterChanged || !currentSessionId) {
+                if (changedChat || hasCharacterChanged || !currentSessionId) {
                     console.log('[EchoGraph] 开始初始化会话...');
                     const initResult = await initializeSession('CHAT_CHANGED');
                     if (initResult) {
@@ -2861,6 +2392,7 @@ jQuery(async () => {
         async function onMessageEdited(this_edit_mes_id) {
             if (!pluginSettings?.enabled || !currentSessionId) return;
             logDebug('Message edited, syncing conversation state');
+            seedRenderedMessages(getSillyTavernContext());
             syncConversationState();
         }
 
@@ -2868,6 +2400,9 @@ jQuery(async () => {
         async function onMessageSwiped(chat_id) {
             if (!pluginSettings?.enabled || !currentSessionId) return;
             logDebug('Message swiped, syncing conversation state');
+            const context = getSillyTavernContext();
+            const message = context.chat?.[chat_id];
+            if (message) renderedMessages.set(messageKey(message), String(message.mes ?? message.content ?? ''));
             syncConversationState();
         }
 
@@ -2877,125 +2412,54 @@ jQuery(async () => {
         try {
             // 使用SillyTavern官方推荐的获取方式
             const context = getContext();
-            const { eventSource, event_types } = context || {};
+            const { eventSource, eventTypes } = context || {};
 
             console.log('[EchoGraph] 事件系统检查:', {
                 hasContext: !!context,
                 hasEventSource: !!eventSource,
-                hasEventTypes: !!event_types,
+                hasEventTypes: !!eventTypes,
                 eventSourceType: typeof eventSource,
                 eventSourceOn: typeof eventSource?.on,
-                eventTypesKeys: Object.keys(event_types || {}),
+                eventTypesKeys: Object.keys(eventTypes || {}),
                 contextKeys: Object.keys(context || {})
             });
 
-            if (eventSource && typeof eventSource.on === 'function' && event_types) {
-                console.log('[EchoGraph] ✅ 使用官方 getContext() 方式绑定事件');
+            if (eventSource && typeof eventSource.on === 'function' && eventTypes) {
+                console.log('[EchoGraph]  使用官方 getContext() 方式绑定事件');
 
-                eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
-                console.log('[EchoGraph] ✅ 已绑定 CHARACTER_MESSAGE_RENDERED');
+                if (eventTypes.CHARACTER_MESSAGE_RENDERED) eventSource.on(eventTypes.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
+                console.log('[EchoGraph]  已绑定 CHARACTER_MESSAGE_RENDERED');
 
-                eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onChatCompletionPromptReady);
-                console.log('[EchoGraph] ✅ 已绑定 CHAT_COMPLETION_PROMPT_READY');
+                if (eventTypes.CHAT_COMPLETION_PROMPT_READY) eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, onChatCompletionPromptReady);
+                console.log('[EchoGraph]  已绑定 CHAT_COMPLETION_PROMPT_READY');
 
-                eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-                console.log('[EchoGraph] ✅ 已绑定 CHAT_CHANGED');
+                if (eventTypes.CHAT_CHANGED) eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
+                console.log('[EchoGraph]  已绑定 CHAT_CHANGED');
 
-                eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
-                console.log('[EchoGraph] ✅ 已绑定 MESSAGE_EDITED');
+                if (eventTypes.MESSAGE_EDITED) eventSource.on(eventTypes.MESSAGE_EDITED, onMessageEdited);
+                console.log('[EchoGraph]  已绑定 MESSAGE_EDITED');
 
-                eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
-                console.log('[EchoGraph] ✅ 已绑定 MESSAGE_SWIPED');
+                if (eventTypes.MESSAGE_SWIPED) eventSource.on(eventTypes.MESSAGE_SWIPED, onMessageSwiped);
+                console.log('[EchoGraph]  已绑定 MESSAGE_SWIPED');
 
-                eventSource.on(event_types.MESSAGE_DELETED, onChatChanged);
-                console.log('[EchoGraph] ✅ 已绑定 MESSAGE_DELETED');
+                if (eventTypes.MESSAGE_DELETED) eventSource.on(eventTypes.MESSAGE_DELETED, () => { seedRenderedMessages(getSillyTavernContext()); syncConversationState(); });
+                console.log('[EchoGraph]  已绑定 MESSAGE_DELETED');
 
-                console.log('[EchoGraph] 🎉 所有事件绑定完成！');
+                if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, (type, _options, dryRun) => {
+                    if (!dryRun) generationType = type;
+                });
+                if (eventTypes.GENERATE_AFTER_COMBINE_PROMPTS) eventSource.on(eventTypes.GENERATE_AFTER_COMBINE_PROMPTS, (_data) => { generationType = null; });
+                if (eventTypes.GENERATION_ENDED) eventSource.on(eventTypes.GENERATION_ENDED, () => { generationType = null; });
+                if (eventTypes.GENERATION_STOPPED) eventSource.on(eventTypes.GENERATION_STOPPED, () => { generationType = null; });
+
+                console.log('[EchoGraph]  所有事件绑定完成！');
 
             } else {
-                console.log('[EchoGraph] ⚠️ SillyTavern.getContext() 事件系统不可用');
+                console.log('[EchoGraph]  SillyTavern.getContext() 事件系统不可用');
             }
 
         } catch (error) {
             console.error('[EchoGraph] 事件绑定过程中出现异常:', error);
-        }
-
-        // 正确的SillyTavern事件绑定方式（根据官方文档）
-        console.log('[EchoGraph] 使用官方推荐的 SillyTavern.getContext() 方式绑定事件');
-
-        try {
-            // 使用官方推荐的方式获取事件源
-            const { eventSource, event_types } = SillyTavern.getContext();
-
-            console.log('[EchoGraph] SillyTavern.getContext() 返回:', {
-                hasEventSource: !!eventSource,
-                hasEventTypes: !!event_types,
-                eventSourceType: typeof eventSource,
-                eventSourceOn: typeof eventSource?.on,
-                eventTypes: event_types ? Object.keys(event_types) : 'undefined'
-            });
-
-            if (eventSource && typeof eventSource.on === 'function' && event_types) {
-                // 绑定CHAT_CHANGED事件
-                eventSource.on(event_types.CHAT_CHANGED, function(data) {
-                    console.log('[EchoGraph] 🎉 官方 CHAT_CHANGED 事件触发!', data);
-
-                    // 给SillyTavern时间完成切换
-                    setTimeout(() => {
-                        console.log('[EchoGraph] 延迟执行 onChatChanged...');
-                        onChatChanged();
-                    }, 200);
-                });
-
-                // 绑定其他相关事件
-                if (event_types.CHARACTER_MESSAGE_RENDERED) {
-                    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageReceived);
-                    console.log('[EchoGraph] ✅ 已绑定 CHARACTER_MESSAGE_RENDERED');
-                }
-
-                if (event_types.CHAT_COMPLETION_PROMPT_READY) {
-                    eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onChatCompletionPromptReady);
-                    console.log('[EchoGraph] ✅ 已绑定 CHAT_COMPLETION_PROMPT_READY');
-                }
-
-                if (event_types.MESSAGE_EDITED) {
-                    eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
-                    console.log('[EchoGraph] ✅ 已绑定 MESSAGE_EDITED');
-                }
-
-                if (event_types.MESSAGE_SWIPED) {
-                    eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
-                    console.log('[EchoGraph] ✅ 已绑定 MESSAGE_SWIPED');
-                }
-
-                console.log('[EchoGraph] 🎉 所有官方事件绑定完成！现在等待角色切换...');
-
-            } else {
-                console.error('[EchoGraph] ❌ SillyTavern.getContext() 没有提供有效的事件系统');
-                console.log('[EchoGraph] 调试信息:', {
-                    SillyTavernExists: typeof SillyTavern !== 'undefined',
-                    getContextExists: typeof SillyTavern?.getContext === 'function',
-                    contextResult: SillyTavern ? SillyTavern.getContext() : 'SillyTavern undefined'
-                });
-            }
-
-        } catch (error) {
-            console.error('[EchoGraph] 官方事件绑定失败:', error);
-
-            // 降级：尝试直接从全局获取
-            console.log('[EchoGraph] 尝试直接访问全局 eventSource...');
-
-            if (typeof window !== 'undefined' && window.eventSource && window.event_types) {
-                try {
-                    window.eventSource.on(window.event_types.CHAT_CHANGED, function(data) {
-                        console.log('[EchoGraph] 🎉 全局 CHAT_CHANGED 事件触发!', data);
-                        setTimeout(() => onChatChanged(), 200);
-                    });
-                    console.log('[EchoGraph] ✅ 成功使用全局 eventSource 绑定');
-                } catch (e) {
-                    console.error('[EchoGraph] 全局 eventSource 绑定也失败:', e);
-                }
-            }
         }
 
         // 初始化session（如果设置允许且有角色）
@@ -3028,7 +2492,6 @@ jQuery(async () => {
         showNotification(`${PLUGIN_NAME} v${PLUGIN_VERSION} loaded successfully`, 'success');
 
         // Show panel toggle for easy access
-        showPanelToggle();
 
     // --- Panel Management Functions ---
 
@@ -3057,6 +2520,10 @@ jQuery(async () => {
     }
 
     function addActivityLog(message, type = 'info') {
+        const logKey = `${type}:${message}`;
+        if (addActivityLog.lastKey === logKey && Date.now() - addActivityLog.lastAt < 1000) return;
+        addActivityLog.lastKey = logKey;
+        addActivityLog.lastAt = Date.now();
         const timestamp = new Date().toLocaleTimeString();
         const activityClass = type === 'success' ? 'cf-activity-success' :
                               type === 'warning' ? 'cf-activity-warning' :
@@ -3064,7 +2531,7 @@ jQuery(async () => {
 
         const activityHtml = `
             <div class="cf-activity-item ${activityClass}">
-                <div>${message}</div>
+                <div>${escapeHtml(message)}</div>
                 <span class="cf-timestamp">${timestamp}</span>
             </div>
         `;
@@ -3211,19 +2678,31 @@ jQuery(async () => {
         }
     }
 
-    async function testAPIConnection() {
+    async function testAPIConnection(apiUrl = pluginSettings.api_base_url) {
+        if (typeof apiUrl !== 'string') apiUrl = pluginSettings.api_base_url;
         try {
             addActivityLog('正在测试API连接...', 'info');
             updatePanelStatus('测试连接中...', 'unknown');
 
-            const response = await fetch(`${pluginSettings.api_base_url}/health`, {
+            const response = await fetch(`${apiUrl}/health`, {
                 signal: AbortSignal.timeout(10000) // 10秒超时
             });
 
             if (response.ok) {
+                const modeResponse = await fetch(`${apiUrl}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                if (!modeResponse.ok) throw new Error(`酒馆模式检查失败: HTTP ${modeResponse.status}`);
+                const mode = await modeResponse.json();
+                if (!mode.active) {
+                    lastHealthOk = false;
+                    updatePanelStatus('酒馆模式未启用', 'disconnected');
+                    $('#cf-main-api-status').removeClass('cf-status-connected cf-status-unknown')
+                        .addClass('cf-status-disconnected').text('酒馆模式未启用');
+                    addActivityLog('EchoGraph 后台未启用酒馆模式', 'warning');
+                    return;
+                }
                 lastHealthOk = true;
                 const data = await response.json();
-                updatePanelStatus('连接成功', 'connected');
+                updatePanelStatus(isWsOpen() ? '已连接' : 'API 可用', isWsOpen() ? 'connected' : 'unknown');
                 addActivityLog(`API连接成功 - 版本: ${data.version || '未知'}`, 'success');
                 showNotification(`EchoGraph API 连接成功！\n版本: ${data.version}\n活跃会话: ${data.active_sessions}`, 'success');
 
@@ -3232,10 +2711,11 @@ jQuery(async () => {
                 if (statusElement.length) {
                     statusElement
                         .removeClass('cf-status-disconnected cf-status-unknown')
-                        .addClass('cf-status-connected')
-                        .text('已连接');
+                        .addClass(isWsOpen() ? 'cf-status-connected' : 'cf-status-unknown')
+                        .text(isWsOpen() ? '已连接' : 'API 可用');
                 }
             } else {
+                lastHealthOk = false;
                 updatePanelStatus('连接失败', 'disconnected');
                 addActivityLog(`API连接失败 - HTTP ${response.status}`, 'error');
                 showNotification(`API连接失败 (${response.status})\n请检查服务器地址和端口`, 'error');
@@ -3250,6 +2730,7 @@ jQuery(async () => {
                 }
             }
         } catch (error) {
+            lastHealthOk = false;
             updatePanelStatus('连接错误', 'disconnected');
             addActivityLog('API连接错误: ' + error.message, 'error');
             showNotification(`无法连接到EchoGraph API\n错误: ${error.message}\n\n请确认：\n1. EchoGraph服务器正在运行\n2. API地址正确 (当前: ${pluginSettings.api_base_url})`, 'error');
@@ -3265,49 +2746,15 @@ jQuery(async () => {
         }
     }
 
-    function showPanelToggle() {
-        // Add a floating toggle button to show/hide the panel
-        const toggleHtml = `
-            <div id="cf-panel-toggle" style="
-                position: fixed;
-                bottom: 20px;
-                right: 20px;
-                width: 50px;
-                height: 50px;
-                background: linear-gradient(135deg, #4a90e2 0%, #357abd 100%);
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                cursor: pointer;
-                box-shadow: 0 4px 20px rgba(74,144,226,0.3);
-                z-index: 9999;
-                transition: all 0.3s ease;
-                color: white;
-                font-size: 18px;
-            " title="切换 EchoGraph 面板">
-                CF
-            </div>
-        `;
-
-        $('body').append(toggleHtml);
-
-        $('#cf-panel-toggle').on('click', () => {
-            if ($('#echograph-panel').is(':visible')) {
-                $('#echograph-panel').hide();
-            } else {
-                $('#echograph-panel').show();
-                refreshPanelStats();
-            }
-        });
-
-        // Hover effects
-        $('#cf-panel-toggle').on('mouseenter', function() {
-            $(this).css('transform', 'scale(1.1)');
-        }).on('mouseleave', function() {
-            $(this).css('transform', 'scale(1)');
-        });
+    if (ST.__echoGraphEnableTestHooks) {
+        ST.__echoGraphTestHooks = {
+            getChatKey, messageKey, switchChat, reconnectDelay, connectWebSocket,
+            onMessageReceived, onChatChanged,
+            setSession(id) { currentSessionId = id; },
+            setLastCharacterId(id) { lastCharacterId = id; },
+            setHealth(ok) { lastHealthOk = ok; },
+            state() { return { currentSessionId, sessionEpoch, reconnectAttempt, hasReconnect: !!reconnectTimer }; }
+        };
     }
-
     console.log("______________________EchoGraph插件：加载完成______________________");
 });
