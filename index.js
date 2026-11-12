@@ -54,6 +54,7 @@ jQuery(async () => {
     let reconnectTimer = null;
     let reconnectAttempt = 0;
     let sessionEpoch = 0;
+    const connectionTests = new Set();
     const processedMessages = new Map();
     const renderedMessages = new Map();
     const pendingPrompts = new WeakSet();
@@ -156,11 +157,13 @@ jQuery(async () => {
 
         webSocket = new WebSocket(wsUrl);
         const thisSocket = webSocket;
+        updateDrawerStatus();
 
         thisSocket.onopen = () => {
             if (webSocket !== thisSocket) return; // ignore stale
             reconnectAttempt = 0;
             lastHealthOk = true;
+            updateDrawerStatus();
             logDebug(`[WS] WebSocket connection established for session ${sessionId}`);
             console.log(`[EchoGraph WS] WebSocket connection established for session ${sessionId}`);
             showNotification('EchoGraph 已连接', 'success');
@@ -265,6 +268,7 @@ jQuery(async () => {
             // reject all pending requests
             rejectSocketRequests(thisSocket);
             webSocket = null;
+            updateDrawerStatus();
             scheduleReconnect();
         };
 
@@ -285,6 +289,7 @@ jQuery(async () => {
             webSocket.close();
             webSocket = null;
         }
+        updateDrawerStatus();
     }
     // --- WS RPC helpers ---
     const pendingRequests = new Map();
@@ -300,6 +305,7 @@ jQuery(async () => {
     function isWsOpen() { return webSocket && webSocket.readyState === WebSocket.OPEN; }
     function sendWsRequest(action, payload = {}, timeoutMs = 20000) {
         return new Promise((resolve, reject) => {
+            if (!pluginSettings?.enabled) return reject(new Error('EchoGraph disabled'));
             const epoch = sessionEpoch;
             const doSend = () => {
                 if (epoch !== sessionEpoch || !isWsOpen()) return reject(new Error('Session changed'));
@@ -499,6 +505,7 @@ jQuery(async () => {
     function loadSettings() {
         // 使用标准的SillyTavern扩展设置系统
         pluginSettings = Object.assign({}, DEFAULT_SETTINGS, getContext().extensionSettings[SETTINGS_KEY] || {});
+        pluginSettings.api_base_url = normalizeApiBaseUrl(pluginSettings.api_base_url);
         return pluginSettings;
     }
 
@@ -802,6 +809,7 @@ jQuery(async () => {
      * Enhanced session initialization with better error handling and configuration
      */
     async function initializeSession(caller = 'unknown', forceReinit = false) {
+        if (!pluginSettings?.enabled) return false;
         logDebug(`initializeSession called by: ${caller}, force: ${forceReinit}`);
         const epoch = sessionEpoch;
 
@@ -901,10 +909,12 @@ jQuery(async () => {
             const mode = await modeResponse.json();
             if (!mode.active) {
                 lastHealthOk = false;
+                updateDrawerStatus();
                 addActivityLog('EchoGraph 后台未启用酒馆模式', 'warning');
                 return false;
             }
             lastHealthOk = true;
+            updateDrawerStatus();
             if (epoch !== sessionEpoch) return false;
             logDebug('Initializing new session...', {
                 characterId: characterId,
@@ -1547,7 +1557,7 @@ jQuery(async () => {
         $('#cf-save-settings').on('click', saveSettingsFromModal);
 
         // Bind test API connection
-        $('#cf-test-api-btn').on('click', () => testAPIConnection($('#cf-api-url').val() || DEFAULT_API_BASE_URL));
+        $('#cf-test-api-btn').on('click', () => testAPIConnection(normalizeApiBaseUrl($('#cf-api-url').val())));
         loadSettingsToModal();
     }
 
@@ -1691,11 +1701,49 @@ jQuery(async () => {
         $('#cf-conflict-resolution').prop('checked', pluginSettings.sliding_window.enable_conflict_resolution);
     }
 
+    function normalizeApiBaseUrl(value) {
+        return String(value || '').trim().replace(/\/+$/, '') || DEFAULT_API_BASE_URL;
+    }
+
+    function syncSettingsControls() {
+        $('#eg-enabled, #cf-enabled').prop('checked', pluginSettings.enabled);
+        $('#eg-api-url, #cf-api-url').val(pluginSettings.api_base_url);
+        $('#eg-notifications, #cf-notifications').prop('checked', pluginSettings.show_notifications);
+        $('#eg-debug, #cf-debug').prop('checked', pluginSettings.debug_mode);
+    }
+
+    function applyConnectionSettings(wasEnabled, oldApiUrl) {
+        if (wasEnabled !== pluginSettings.enabled || oldApiUrl !== pluginSettings.api_base_url) {
+            sessionEpoch++;
+            disconnectWebSocket();
+            lastHealthOk = false;
+        }
+        if (!pluginSettings.enabled) {
+            stopHeartbeat();
+            updatePanelStatus('已禁用', 'disconnected');
+        } else {
+            if (!wasEnabled) startHeartbeat();
+            if (!wasEnabled || oldApiUrl !== pluginSettings.api_base_url) {
+                const apiUrl = pluginSettings.api_base_url;
+                if (currentSessionId) {
+                    void testAPIConnection(apiUrl).then((connected) => {
+                        if (connected && pluginSettings.enabled && pluginSettings.api_base_url === apiUrl) connectWebSocket(currentSessionId);
+                    });
+                } else if (pluginSettings.auto_initialize) {
+                    void onChatChanged();
+                }
+            }
+        }
+        $('#echograph-panel').toggle(pluginSettings.debug_mode);
+        syncSettingsControls();
+        updateDrawerStatus();
+    }
+
     function saveSettingsFromModal() {
         const wasEnabled = pluginSettings.enabled;
         const oldApiUrl = pluginSettings.api_base_url;
         pluginSettings.enabled = $('#cf-enabled').prop('checked');
-        pluginSettings.api_base_url = $('#cf-api-url').val();
+        pluginSettings.api_base_url = normalizeApiBaseUrl($('#cf-api-url').val());
         pluginSettings.auto_initialize = $('#cf-auto-init').prop('checked');
         pluginSettings.show_notifications = $('#cf-notifications').prop('checked');
         pluginSettings.memory_enhancement.hot_memory_turns = parseInt($('#cf-hot-memory').val());
@@ -1710,29 +1758,9 @@ jQuery(async () => {
         pluginSettings.sliding_window.enable_conflict_resolution = $('#cf-conflict-resolution').prop('checked');
 
         saveSettings();
-        if (!pluginSettings.enabled) {
-            stopHeartbeat();
-            disconnectWebSocket();
-            updatePanelStatus('已禁用', 'disconnected');
-        } else {
-            startHeartbeat();
-            if (!wasEnabled || oldApiUrl !== pluginSettings.api_base_url) {
-                disconnectWebSocket();
-                lastHealthOk = false;
-                if (currentSessionId) testAPIConnection().then(() => {
-                    if (lastHealthOk) connectWebSocket(currentSessionId);
-                });
-            }
-        }
+        applyConnectionSettings(wasEnabled, oldApiUrl);
         $('#echograph-settings-modal').hide();
         showNotification('设置已成功保存', 'success');
-
-        // Update debug panel visibility
-        if (pluginSettings.debug_mode) {
-            $('#echograph-panel').show();
-        } else {
-            $('#echograph-panel').hide();
-        }
     }
 
     function updateDebugPanel() {
@@ -1782,13 +1810,11 @@ jQuery(async () => {
         const mainPageHtml = `
             <div id="echograph-main-page" class="eg-style-19">
                 <div class="cf-main-header eg-style-20">
-                    <h1 class="eg-style-21">
-                        EchoGraph 滑动窗口智能增强
-                    </h1>
-                    <p class="eg-style-22">
-                        版本 ${PLUGIN_VERSION} - 智能对话记忆管理系统
-                    </p>
-                    <button id="cf-close-main-page" class="eg-style-23">× 关闭</button>
+                    <div class="cf-main-heading">
+                        <h1 class="eg-style-21">EchoGraph 滑动窗口智能增强</h1>
+                        <p class="eg-style-22">版本 ${PLUGIN_VERSION} - 智能对话记忆管理系统</p>
+                    </div>
+                    <button id="cf-close-main-page" class="menu_button eg-style-23" type="button">× 关闭</button>
                 </div>
 
                 <div class="cf-main-content eg-style-24">
@@ -1945,15 +1971,20 @@ jQuery(async () => {
 
     // 轻量级API状态检查：用于主页面打开后延迟检查一次，不弹窗，只更新状态指示
     async function checkAPIStatus() {
+        if (!pluginSettings?.enabled) return;
+        const epoch = sessionEpoch;
         try {
             const response = await fetch(`${pluginSettings.api_base_url}/health`, {
                 signal: AbortSignal.timeout(5000)
             });
+            if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
             const statusElement = $('#cf-main-api-status');
             if (response.ok) {
                 const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                 if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
                 const mode = await modeResponse.json();
+                if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                 lastHealthOk = !!mode.active;
                 if (!mode.active) {
                     statusElement.removeClass('cf-status-connected cf-status-unknown')
@@ -1973,6 +2004,7 @@ jQuery(async () => {
                 updatePanelStatus('连接异常', 'disconnected');
             }
         } catch (error) {
+            if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
             lastHealthOk = false;
             const statusElement = $('#cf-main-api-status');
             statusElement.removeClass('cf-status-connected cf-status-unknown')
@@ -2059,6 +2091,58 @@ jQuery(async () => {
         }
     }
 
+    function updateDrawerStatus() {
+        const status = !pluginSettings?.enabled ? '已禁用'
+            : webSocket?.readyState === WebSocket.OPEN ? '已连接'
+            : webSocket?.readyState === WebSocket.CONNECTING ? '连接中…'
+            : [...connectionTests].some(test => test.epoch === sessionEpoch && test.url === pluginSettings.api_base_url) ? '连接中…'
+            : !currentSessionId && lastHealthOk ? '已连接' : '未连接';
+        $('#eg-connection-status').text(status);
+    }
+
+    function addSettingsDrawer() {
+        const settingsColumn = $('#extensions_settings2');
+        if (!settingsColumn.length || $('#echograph-settings-drawer').length) return;
+
+        settingsColumn.append(`
+            <div id="echograph-settings-drawer" class="extension_container">
+                <div class="inline-drawer">
+                    <div class="inline-drawer-toggle inline-drawer-header">
+                        <b>EchoGraph</b>
+                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                    </div>
+                    <div class="inline-drawer-content">
+                        <label class="checkbox_label"><input id="eg-enabled" type="checkbox">启用 EchoGraph</label>
+                        <label for="eg-api-url">后端地址</label>
+                        <div class="flex-container">
+                            <input id="eg-api-url" class="text_pole" type="text" placeholder="${DEFAULT_API_BASE_URL}">
+                            <button id="eg-test-connection" class="menu_button" type="button">测试连接</button>
+                        </div>
+                        <div>连接状态：<span id="eg-connection-status" aria-live="polite">未连接</span></div>
+                        <label class="checkbox_label"><input id="eg-notifications" type="checkbox">显示通知</label>
+                        <label class="checkbox_label"><input id="eg-debug" type="checkbox">调试模式</label>
+                        <button id="eg-open-panel" class="menu_button" type="button">打开 EchoGraph 面板</button>
+                    </div>
+                </div>
+            </div>
+        `);
+
+        $('#eg-enabled, #eg-notifications, #eg-debug, #eg-api-url').on('change', () => {
+            const wasEnabled = pluginSettings.enabled;
+            const oldApiUrl = pluginSettings.api_base_url;
+            pluginSettings.enabled = $('#eg-enabled').prop('checked');
+            pluginSettings.api_base_url = normalizeApiBaseUrl($('#eg-api-url').val());
+            pluginSettings.show_notifications = $('#eg-notifications').prop('checked');
+            pluginSettings.debug_mode = $('#eg-debug').prop('checked');
+            saveSettings();
+            applyConnectionSettings(wasEnabled, oldApiUrl);
+        });
+        $('#eg-test-connection').on('click', () => testAPIConnection(normalizeApiBaseUrl($('#eg-api-url').val())));
+        $('#eg-open-panel').on('click', showEchoGraphMainPage);
+        syncSettingsControls();
+        updateDrawerStatus();
+    }
+
     function addMenuItems() {
         logDebug('尝试添加菜单项到扩展菜单...');
         const extensionsBlock = $('#extensionsMenu');
@@ -2106,10 +2190,11 @@ jQuery(async () => {
 .eg-style-17 { margin-top: 16px; padding-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
 .eg-style-18 { display: none; }
 .eg-style-19 { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 10001; overflow-y: auto; }
-.eg-style-20 { padding: 16px; text-align: center; }
+.eg-style-20 { flex-wrap: wrap; text-align: left; }
+.cf-main-heading { flex: 1 1 220px; min-width: 0; overflow-wrap: anywhere; }
 .eg-style-21 { margin: 0; font-size: 28px; }
-.eg-style-22 { margin: 8px 0 0 0; font-size: 16px; }
-.eg-style-23 { position: absolute; top: 16px; right: 16px; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 16px; }
+.eg-style-22 { margin: 8px 0 0; font-size: 13px; color: var(--eg-fg); opacity: .75; }
+.eg-style-23 { flex: 0 0 auto; margin-left: auto; }
 .eg-style-24 { padding: 30px; max-width: 1200px; margin: 0 auto; }
 .eg-style-25 { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 24px; margin-bottom: 30px; }
 .eg-style-26 { border-radius: 12px; padding: 24px; }
@@ -2142,6 +2227,9 @@ jQuery(async () => {
 #echograph-panel.minimized .cf-panel-body { display: none; }
 .cf-panel-header, .cf-main-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 16px; border-bottom: 1px solid var(--eg-border); background: var(--eg-bg); color: var(--eg-fg); }
 .cf-panel-title, .cf-panel-controls, .cf-button-group { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cf-panel-header, #echograph-settings-modal .eg-style-3 { flex-wrap: wrap; }
+.cf-panel-title { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+.cf-panel-controls, #cf-close-settings { margin-left: auto; }
 .cf-panel-body { max-height: calc(100dvh - 88px); overflow-y: auto; padding: 16px; }
 .cf-panel-body h3, .cf-card h3, #echograph-settings-modal h3, #echograph-settings-modal h5 { color: var(--SmartThemeEmColor, var(--eg-fg)); margin: 0 0 16px; }
 .cf-status-section, .cf-controls-section, .cf-memory-section, .cf-card { padding: 16px; margin-bottom: 16px; border: 1px solid var(--eg-border); border-radius: 8px; background: var(--eg-bg); min-width: 0; }
@@ -2154,6 +2242,7 @@ jQuery(async () => {
 .cf-status-connected::before, .cf-status-disconnected::before, .cf-status-unknown::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--eg-accent); }
 .cf-status-disconnected::before { background: var(--eg-border); }
 .cf-status-unknown::before { background: var(--SmartThemeEmColor, var(--eg-border)); }
+#cf-main-api-status::before { content: none; }
 #echograph-main-page { position: fixed; inset: 0; width: 100%; height: 100dvh; z-index: 10001; overflow-y: auto; background: var(--eg-bg); color: var(--eg-fg); }
 #echograph-main-page .cf-main-content { width: min(1080px, calc(100vw - 16px)); margin: 0 auto; padding: 16px; overflow-x: hidden; }
 #echograph-main-page .cf-main-header { position: sticky; top: 0; z-index: 1; }
@@ -2180,6 +2269,7 @@ jQuery(async () => {
     loadSettings();
 
     // Create UI elements
+    addSettingsDrawer();
     createDebugPanel();
 
     // Add menu items with multiple retry attempts to ensure SillyTavern UI is ready
@@ -2231,17 +2321,21 @@ jQuery(async () => {
                     return;
                 }
                 heartbeatBusy = true;
+                const epoch = sessionEpoch;
 
                 try {
                     logDebug('执行心跳检测...');
                     const response = await fetch(`${pluginSettings.api_base_url}/health`, {
                         signal: AbortSignal.timeout(5000)
                     });
+                    if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
 
                     if (response.ok) {
                         const modeResponse = await fetch(`${pluginSettings.api_base_url}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                        if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                         if (!modeResponse.ok) throw new Error(`Tavern mode check failed: HTTP ${modeResponse.status}`);
                         const mode = await modeResponse.json();
+                        if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                         if (!mode.active) {
                             lastHealthOk = false;
                             disconnectWebSocket();
@@ -2250,10 +2344,12 @@ jQuery(async () => {
                         }
                         lastHealthOk = true;
                         const data = await response.json();
+                        if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                         if (isWsOpen()) {
                             try { await sendWsRequest('ping', {}, 5000); }
                             catch (error) { try { webSocket?.close(); } catch (e) {} }
                         }
+                        if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                         logDebug(`心跳检测成功 - 活跃会话: ${data.active_sessions}`);
 
                         // 更新连接状态指示器
@@ -2284,6 +2380,7 @@ jQuery(async () => {
                         }
                     }
                 } catch (error) {
+                    if (epoch !== sessionEpoch || !pluginSettings.enabled) return;
                     lastHealthOk = false;
                     cancelReconnect();
                     logDebug(`心跳检测异常: ${error.message}`);
@@ -2496,6 +2593,7 @@ jQuery(async () => {
     // --- Panel Management Functions ---
 
     function updatePanelStatus(status, connectionState) {
+        updateDrawerStatus();
         const statusIndicator = $('#cf-api-status');
         statusIndicator.removeClass('cf-status-connected cf-status-disconnected cf-status-unknown');
 
@@ -2680,6 +2778,11 @@ jQuery(async () => {
 
     async function testAPIConnection(apiUrl = pluginSettings.api_base_url) {
         if (typeof apiUrl !== 'string') apiUrl = pluginSettings.api_base_url;
+        const epoch = sessionEpoch;
+        const tracksCurrentBackend = () => pluginSettings.enabled && apiUrl === pluginSettings.api_base_url;
+        const test = { url: apiUrl, epoch };
+        if (tracksCurrentBackend()) connectionTests.add(test);
+        updateDrawerStatus();
         try {
             addActivityLog('正在测试API连接...', 'info');
             updatePanelStatus('测试连接中...', 'unknown');
@@ -2687,21 +2790,25 @@ jQuery(async () => {
             const response = await fetch(`${apiUrl}/health`, {
                 signal: AbortSignal.timeout(10000) // 10秒超时
             });
+            if (epoch !== sessionEpoch) return false;
 
             if (response.ok) {
                 const modeResponse = await fetch(`${apiUrl}/system/tavern_mode`, { signal: AbortSignal.timeout(5000) });
+                if (epoch !== sessionEpoch) return false;
                 if (!modeResponse.ok) throw new Error(`酒馆模式检查失败: HTTP ${modeResponse.status}`);
                 const mode = await modeResponse.json();
+                if (epoch !== sessionEpoch) return false;
                 if (!mode.active) {
-                    lastHealthOk = false;
+                    if (tracksCurrentBackend()) lastHealthOk = false;
                     updatePanelStatus('酒馆模式未启用', 'disconnected');
                     $('#cf-main-api-status').removeClass('cf-status-connected cf-status-unknown')
                         .addClass('cf-status-disconnected').text('酒馆模式未启用');
                     addActivityLog('EchoGraph 后台未启用酒馆模式', 'warning');
-                    return;
+                    return false;
                 }
-                lastHealthOk = true;
+                if (tracksCurrentBackend()) lastHealthOk = true;
                 const data = await response.json();
+                if (epoch !== sessionEpoch) return false;
                 updatePanelStatus(isWsOpen() ? '已连接' : 'API 可用', isWsOpen() ? 'connected' : 'unknown');
                 addActivityLog(`API连接成功 - 版本: ${data.version || '未知'}`, 'success');
                 showNotification(`EchoGraph API 连接成功！\n版本: ${data.version}\n活跃会话: ${data.active_sessions}`, 'success');
@@ -2714,8 +2821,9 @@ jQuery(async () => {
                         .addClass(isWsOpen() ? 'cf-status-connected' : 'cf-status-unknown')
                         .text(isWsOpen() ? '已连接' : 'API 可用');
                 }
+                return tracksCurrentBackend();
             } else {
-                lastHealthOk = false;
+                if (tracksCurrentBackend()) lastHealthOk = false;
                 updatePanelStatus('连接失败', 'disconnected');
                 addActivityLog(`API连接失败 - HTTP ${response.status}`, 'error');
                 showNotification(`API连接失败 (${response.status})\n请检查服务器地址和端口`, 'error');
@@ -2728,9 +2836,11 @@ jQuery(async () => {
                         .addClass('cf-status-disconnected')
                         .text('连接失败');
                 }
+                return false;
             }
         } catch (error) {
-            lastHealthOk = false;
+            if (epoch !== sessionEpoch) return false;
+            if (tracksCurrentBackend()) lastHealthOk = false;
             updatePanelStatus('连接错误', 'disconnected');
             addActivityLog('API连接错误: ' + error.message, 'error');
             showNotification(`无法连接到EchoGraph API\n错误: ${error.message}\n\n请确认：\n1. EchoGraph服务器正在运行\n2. API地址正确 (当前: ${pluginSettings.api_base_url})`, 'error');
@@ -2743,6 +2853,10 @@ jQuery(async () => {
                     .addClass('cf-status-disconnected')
                     .text('未连接');
             }
+            return false;
+        } finally {
+            connectionTests.delete(test);
+            updateDrawerStatus();
         }
     }
 
