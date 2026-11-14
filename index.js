@@ -39,16 +39,25 @@ jQuery(async () => {
                 error.network = [404, 502, 503, 504].includes(result.status);
                 throw error;
             }
-            return await result.json();
+            const data = await result.json();
+            if (path !== '/timeline/heartbeat' && settings.enabled) void heartbeat();
+            return data;
         } finally { clearTimeout(id); }
     }
     const post = (path, payload) => request(path, { method: 'POST', body: JSON.stringify(payload) });
 
+    async function heartbeat() {
+        if (!settings.enabled) return;
+        try {
+            await post('/timeline/heartbeat', { chat_uuid: chatUuid });
+            if (settings.enabled && !chatUuid) updateStatus({ state: 'idle' });
+        } catch (error) {
+            if (settings.enabled && !chatUuid) updateStatus({ state: 'disconnected', reason: error.message });
+        }
+    }
+
     function renderStatus() {
-        const text = status.state === 'processing' ? '图谱更新中'
-            : status.state === 'inconsistent' ? `图谱与聊天不一致：${status.reason || '提取失败'}`
-            : status.state === 'needs_base' ? `需要构建基础图（${status.progress || 0}%）`
-            : status.state === 'consistent' ? '已连接' : '未连接';
+        const text = logic.statusText(status);
         $('#eg-timeline-status').text(text);
         $('#eg-timeline-header-status').text(text);
         $('#eg-timeline-retry').toggle(status.state === 'inconsistent' ||
@@ -115,7 +124,7 @@ jQuery(async () => {
         const ctx = context(), key = `${ctx.groupId || ctx.characters?.[ctx.characterId]?.avatar}:${ctx.chatId}`;
         if (!ctx.chatId || (!ctx.groupId && !ctx.characters?.[ctx.characterId])) {
             ++epoch; chatUuid = null; chatKey = null;
-            updateStatus({ state: 'disconnected' });
+            void heartbeat();
             return;
         }
         const currentEpoch = ++epoch;
@@ -295,5 +304,7 @@ jQuery(async () => {
         if (digest !== lastObservedHash) scheduleReconcile();
     }, 3000);
     setInterval(() => { if (settings.enabled && chatUuid) void pollStatus(); }, 3000);
+    setInterval(() => { if (settings.enabled) void heartbeat(); }, 10000);
+    if (settings.enabled) void heartbeat();
     if (context().chatId) void register();
 });

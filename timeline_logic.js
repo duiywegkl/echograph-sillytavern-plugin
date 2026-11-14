@@ -144,6 +144,13 @@
         for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
         return (h >>> 0).toString(16);
     }
+    function statusText(status) {
+        return status.state === 'processing' ? '图谱更新中'
+            : status.state === 'inconsistent' ? `图谱与聊天不一致：${status.reason || '提取失败'}`
+            : status.state === 'needs_base' ? `需要构建基础图（${status.progress || 0}%）`
+            : status.state === 'consistent' ? '已连接'
+            : status.state === 'idle' ? '已连接（未打开聊天）' : '未连接';
+    }
     return { activeExtra, isNotice, roleAndInclusion, stamp, normalize,
-        registrationPayload, basePayload, hash };
+        registrationPayload, basePayload, hash, statusText };
 });

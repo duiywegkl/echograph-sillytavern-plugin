@@ -1,6 +1,11 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { stamp, normalize, hash, registrationPayload, basePayload } = require('./timeline_logic.js');
+const { stamp, normalize, hash, registrationPayload, basePayload, statusText } = require('./timeline_logic.js');
+
+test('reachable backend with no chat shows connected idle status', () => {
+    assert.equal(statusText({ state: 'idle' }), '已连接（未打开聊天）');
+    assert.equal(statusText({ state: 'disconnected' }), '未连接');
+});
 
 test('group base payload includes every member and character book in avatar order', async () => {
     const alice = { avatar: 'a.png', data: { name: 'Alice', description: 'Scout',
