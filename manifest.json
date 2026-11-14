@@ -1,11 +1,11 @@
 {
     "id": "echograph-rag-enhancer",
-    "display_name": "EchoGraph 滑动窗口智能增强",
+    "display_name": "EchoGraph 时间线图谱",
     "loading_order": 101,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "author": "EchoGraph Engine",
     "version": "1.0.0",
-    "description": "基于滑动窗口系统的智能对话增强插件，支持冲突解决和延迟处理"
+    "description": "让知识图谱跟随当前聊天时间线"
 }
